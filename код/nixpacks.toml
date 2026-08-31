@@ -1,0 +1,4 @@
+# Ставим ffmpeg в образ (нужен для уникализации видео). aptPkgs добавляется
+# к фазе setup, не ломая авто-детект Node от Nixpacks.
+[phases.setup]
+aptPkgs = ["ffmpeg", "curl"]

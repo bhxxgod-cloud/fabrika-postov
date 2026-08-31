@@ -1,0 +1,37 @@
+{
+  "name": "neironka-poster",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Мультиплатформенный автопостер (TikTok/Threads/YouTube/Instagram) через облачный браузер GoLogin + Playwright. Standalone-сервис с воронкой атрибуции и A/B-когортами прогрева.",
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "typecheck": "tsc --noEmit",
+    "predeploy": "npm run typecheck",
+    "deploy": "railway up --service web -e production",
+    "deploy:engines": "railway up --service ig-worker -e production"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.111.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "ffmpeg-static": "^5.3.0",
+    "gologin": "^3.0.2",
+    "multer": "^2.2.0",
+    "pg": "^8.13.1",
+    "playwright-core": "^1.49.1",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.7.3"
+  }
+}

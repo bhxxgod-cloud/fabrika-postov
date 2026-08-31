@@ -1,0 +1,1 @@
+worker: python ig_comment_worker.py

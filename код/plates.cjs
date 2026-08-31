@@ -1,0 +1,494 @@
+// plates.cjs — ВАРИАНТЫ ФИНАЛЬНОЙ ПЛАШКИ ПРИЗЫВА (сайд-задача 11.08, приказ начальника:
+// «догенерим плашку искать нейронка про промпты, самая красивая с яндексом, нужно 5 вариков
+// с яндексом строкой и 5 еще других»).
+//
+// ЧТО ЭТО. Отдельная витрина стилей плашки для ЧЕТВЁРТОГО кадра. Ничего в рабочем конвейере не
+// меняет: slidekit.cjs (CTA_STYLES, кадр 4:5 под инстаграм) и ttkit.cjs (ctaSlideTT, 9:16 под
+// тикток) остаются как есть. Здесь лежат 10 новых стилей, чтобы начальник выбрал глазами, и
+// только после выбора победитель переносится в CTA_STYLES слидкита.
+//
+// ЧЕМ РИСУЕМ. Тем же, чем весь проект: HTML и CSS поверх кадра в статичном headless Chrome,
+// снимок вкладки, потом ffmpeg в jpeg. Никакой генерации моделью, бюджет ноль.
+//
+// СЛОВО-МАРКЕР НЕ ПИШЕМ РУКАМИ. Его отдаёт контракт templates.frame4Marker(platform): для
+// инстаграма (reels) это «промпты», для тиктока «шаблоны». По слову в поисковом запросе мы и
+// различаем, с какой площадки пришёл человек, поэтому в стилях стоит подстановка ${m}, а не текст.
+//
+// ЗАПУСК
+//   node plates.cjs --catalog                       все 10 стилей на 3 кадра + две склейки
+//   node plates.cjs --one ya-real --src кадр.jpg --out /tmp/p.jpg
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync, spawnSync } = require('node:child_process');
+const FF = require('ffmpeg-static');
+
+const W = 1080, H = 1350;   // наш кадр 4:5, как во всём инстаграмном пути
+
+// ═══ БЕЗОПАСНАЯ ЗОНА ПО НИЗУ ═════════════════════════════════════════════════════════════════
+// Откуда цифра. Действующие плашки слидкита стоят низом на 200-300 px от низа кадра, и именно
+// такие кадры начальник принял на 10 из 10. Тикток мы НЕ ломаем: там кадр собирается заново
+// (ttkit.ctaSlideTT) по своим измеренным полям SAFE.bottom = 660 из 1920, наш текст в это не
+// попадает вообще. Поэтому здесь одна общая нижняя привязка для всех десяти стилей: ниже 240 px
+// не опускается ни одна плашка, и все они стоят в одной полосе, чтобы сравнение было честным.
+const BOTTOM = 240;
+const SIDE = 70;            // боковые поля: как у действующих плашек слидкита
+
+// Тон подложки берём с кадра (а не чистый чёрный): плашка читается частью поста, а не наклейкой.
+// Светлоту приводим к яркости около 34 из 255, иначе на светлом кадре подложка станет белой и
+// белый текст исчезнет.
+function tone(src) {
+  try {
+    const r = spawnSync(FF, ['-hide_banner', '-i', src, '-vf', 'crop=iw:ih*0.34:0:ih*0.66,scale=1:1',
+      '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'], { maxBuffer: 1 << 20 });
+    const b = r.stdout;
+    if (b && b.length >= 3) {
+      const lum = 0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2];
+      const k = lum > 1 ? Math.min(1, 34 / lum) : 1;
+      return [Math.round(b[0] * k), Math.round(b[1] * k), Math.round(b[2] * k)];
+    }
+  } catch {}
+  return [10, 10, 12];
+}
+const rgba = (t, a) => `rgba(${t[0]},${t[1]},${t[2]},${a})`;
+
+// Мягкое затемнение снизу под текст. Одинаковое у всех стилей, где оно нужно: без него белый
+// текст пропадает на светлом кадре (проверено на уличном дневном кадре).
+const fade = (t, h = 560, top = 0.86) => `.fade{position:absolute;left:0;right:0;bottom:0;height:${h}px;
+  background:linear-gradient(to top,${rgba(t, top)} 0%,${rgba(t, top * 0.78)} 30%,
+    ${rgba(t, top * 0.45)} 62%,${rgba(t, 0)} 100%)}`;
+
+// Лупа. Два размера: серая для светлой строки, светлая для тёмной.
+const lens = (c = '#8a8a8f', s = 34) => `<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none"
+  stroke="${c}" stroke-width="2.2" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.6"/>
+  <path d="M15.4 15.4 L21 21"/></svg>`;
+// Часы: строка истории поиска в подсказках яндекса.
+const clock = (c = '#b3b3b8', s = 28) => `<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none"
+  stroke="${c}" stroke-width="2.1" stroke-linecap="round"><circle cx="12" cy="12" r="8.6"/>
+  <path d="M12 7.4V12l3.4 2.1"/></svg>`;
+
+// ═══ ПЯТЬ СТИЛЕЙ СО СТРОКОЙ ЯНДЕКСА ══════════════════════════════════════════════════════════
+// Разные ПО ПОДАЧЕ, а не по цвету одной кнопки: живая строка с кнопкой, тёмное стекло, набор
+// текста прямо сейчас, выпадающая подсказка, компакт с логотипом.
+const YA = {
+  // Я1. Настоящая строка яндекса: белое поле, лупа, красная кнопка «Найти».
+  'ya-real': {
+    n: 1, group: 'ya', name: 'живая строка яндекса с кнопкой «Найти»',
+    css: (t) => `${fade(t)}
+      .wrap{position:absolute;left:${SIDE}px;right:${SIDE}px;bottom:${BOTTOM}px;color:#fff}
+      .lead{font-size:30px;line-height:1.34;font-weight:500;color:rgba(255,255,255,.94);
+        text-shadow:0 2px 10px rgba(0,0,0,.6);margin-bottom:18px}
+      .bar{display:flex;align-items:stretch;height:96px;background:#fff;border-radius:22px;
+        overflow:hidden;box-shadow:0 18px 44px rgba(0,0,0,.38)}
+      .bar .in{flex:1;display:flex;align-items:center;gap:18px;padding:0 8px 0 26px;min-width:0}
+      .bar .q{font-size:38px;font-weight:600;color:#16181d;letter-spacing:-.3px;white-space:nowrap}
+      .bar .go{display:flex;align-items:center;padding:0 36px;background:#fc3f1d;color:#fff;
+        font-size:30px;font-weight:700;letter-spacing:.2px}
+      .foot{margin-top:18px;font-size:25px;color:rgba(255,255,255,.88);text-shadow:0 2px 9px rgba(0,0,0,.65)}
+      .foot b{font-weight:700;color:#fff}`,
+    block: (m) => `<div class="fade"></div><div class="wrap">
+      <div class="lead">делала себе тут, просто наберите в яндексе:</div>
+      <div class="bar"><div class="in">${lens()}<span class="q">нейронка про ${m}</span></div>
+        <div class="go">Найти</div></div>
+      <div class="foot"><b>neironka.pro</b> · первые генерации бесплатно</div></div>`,
+  },
+
+  // Я2. Тёмное стекло: строка не белая, а полупрозрачная с размытием. Держится на любом кадре и
+  // не выжигает белым прямоугольником тёмную картинку.
+  'ya-glass': {
+    n: 2, group: 'ya', name: 'тёмная строка на матовом стекле',
+    css: (t) => `${fade(t, 520, 0.72)}
+      .wrap{position:absolute;left:${SIDE}px;right:${SIDE}px;bottom:${BOTTOM}px;color:#fff}
+      .kick{font-size:23px;font-weight:700;letter-spacing:3.4px;text-transform:uppercase;
+        color:rgba(255,255,255,.72);margin-bottom:16px;text-shadow:0 2px 8px rgba(0,0,0,.6)}
+      .bar{display:flex;align-items:center;gap:20px;padding:24px 30px;border-radius:999px;
+        background:rgba(18,18,24,.52);border:1.5px solid rgba(255,255,255,.26);
+        -webkit-backdrop-filter:blur(18px) saturate(1.1);backdrop-filter:blur(18px) saturate(1.1);
+        box-shadow:0 16px 40px rgba(0,0,0,.4)}
+      .bar .q{flex:1;font-size:38px;font-weight:600;letter-spacing:-.3px;white-space:nowrap;
+        text-shadow:0 1px 6px rgba(0,0,0,.5)}
+      .bar .go{font-size:26px;font-weight:700;color:#d3b6ff;padding-left:20px;
+        border-left:2px solid rgba(255,255,255,.2)}
+      .foot{margin-top:16px;font-size:25px;color:rgba(255,255,255,.84);text-shadow:0 2px 9px rgba(0,0,0,.65)}
+      .foot b{font-weight:700;color:#fff}`,
+    block: (m) => `<div class="fade"></div><div class="wrap">
+      <div class="kick">ищи в яндексе</div>
+      <div class="bar">${lens('rgba(255,255,255,.9)')}<span class="q">нейронка про ${m}</span>
+        <span class="go">найти</span></div>
+      <div class="foot"><b>neironka.pro</b> · попытки бесплатные</div></div>`,
+  },
+
+  // Я3. Набирают прямо сейчас: курсор после текста и живая мелочь «поиск по запросу». Читается
+  // как чужой экран, а не как баннер, поэтому не вызывает слепоту на рекламу.
+  'ya-typing': {
+    n: 3, group: 'ya', name: 'строка с курсором, будто печатают сейчас',
+    css: (t) => `${fade(t)}
+      .wrap{position:absolute;left:${SIDE}px;right:${SIDE}px;bottom:${BOTTOM}px;color:#fff}
+      .lead{font-size:29px;font-weight:500;color:rgba(255,255,255,.92);margin-bottom:16px;
+        text-shadow:0 2px 10px rgba(0,0,0,.6)}
+      .bar{display:flex;align-items:center;gap:18px;height:98px;padding:0 30px;background:#fff;
+        border-radius:20px;box-shadow:0 18px 44px rgba(0,0,0,.38)}
+      .bar .q{font-size:38px;font-weight:600;color:#16181d;letter-spacing:-.3px;white-space:nowrap}
+      .caret{width:4px;height:44px;background:#16181d;border-radius:2px;margin-left:2px}
+      .x{margin-left:auto;font-size:34px;color:#c2c2c8;font-weight:400}
+      .foot{margin-top:16px;display:flex;align-items:center;gap:12px;font-size:24px;
+        color:rgba(255,255,255,.86);text-shadow:0 2px 9px rgba(0,0,0,.65)}
+      .foot .dot{width:8px;height:8px;border-radius:50%;background:#7dd77d}
+      .foot b{font-weight:700;color:#fff}`,
+    block: (m) => `<div class="fade"></div><div class="wrap">
+      <div class="lead">весь секрет в одном запросе:</div>
+      <div class="bar">${lens()}<span class="q">нейронка про ${m}</span><span class="caret"></span>
+        <span class="x">×</span></div>
+      <div class="foot"><span class="dot"></span><span><b>neironka.pro</b> · первые генерации бесплатно</span></div></div>`,
+  },
+
+  // Я4. Выпадающая подсказка: под строкой две подсказки, как в живом поиске. Самый «настоящий»
+  // вариант: зритель видит, что запрос существует, и не думает, что мы выдумали слова.
+  'ya-suggest': {
+    n: 4, group: 'ya', name: 'строка с выпадающей подсказкой поиска',
+    css: (t) => `${fade(t, 620)}
+      .wrap{position:absolute;left:${SIDE}px;right:${SIDE}px;bottom:${BOTTOM}px;color:#fff}
+      .lead{font-size:29px;font-weight:500;color:rgba(255,255,255,.92);margin-bottom:18px;
+        text-shadow:0 2px 10px rgba(0,0,0,.6)}
+      .card{background:#fff;border-radius:24px;overflow:hidden;box-shadow:0 20px 50px rgba(0,0,0,.4)}
+      .row1{display:flex;align-items:center;gap:18px;height:96px;padding:0 28px}
+      .row1 .q{font-size:37px;font-weight:600;color:#16181d;letter-spacing:-.3px;white-space:nowrap}
+      .row1 .go{margin-left:auto;font-size:25px;font-weight:600;color:#fc3f1d}
+      .sep{height:1.5px;background:rgba(0,0,0,.08);margin:0 24px}
+      .sg{display:flex;align-items:center;gap:16px;padding:20px 28px;font-size:31px;color:#3a3a41}
+      .sg b{font-weight:700;color:#16181d}
+      .foot{margin-top:16px;font-size:25px;color:rgba(255,255,255,.86);text-shadow:0 2px 9px rgba(0,0,0,.65)}
+      .foot b{font-weight:700;color:#fff}`,
+    block: (m) => `<div class="fade"></div><div class="wrap">
+      <div class="lead">наберите в яндексе, подсказка сама допишет:</div>
+      <div class="card">
+        <div class="row1">${lens()}<span class="q">нейронка про ${m}</span><span class="go">найти</span></div>
+        <div class="sep"></div>
+        <div class="sg">${clock()}<span>нейронка про ${m} <b>бесплатно</b></span></div>
+        <div class="sg">${lens('#b3b3b8', 28)}<span>нейронка про ${m} <b>по фото</b></span></div>
+      </div>
+      <div class="foot"><b>neironka.pro</b> · новым 50 ₽ на попытки</div></div>`,
+  },
+
+  // Я5. Компакт: логотип и запрос в один ряд. Занимает меньше всего кадра, годится там, где низ
+  // снимка важен по композиции (руки, одежда).
+  'ya-compact': {
+    n: 5, group: 'ya', name: 'компактная строка в один ряд с логотипом',
+    css: (t) => `${fade(t, 420, 0.62)}
+      .wrap{position:absolute;left:${SIDE}px;right:${SIDE}px;bottom:${BOTTOM}px;color:#fff}
+      .bar{display:flex;align-items:center;gap:20px;height:92px;padding:0 26px 0 12px;
+        background:#fff;border-radius:999px;box-shadow:0 16px 40px rgba(0,0,0,.36)}
+      .ya{width:68px;height:68px;border-radius:18px;background:#fc3f1d;color:#fff;flex:0 0 auto;
+        display:flex;align-items:center;justify-content:center;font-size:44px;font-weight:800;
+        line-height:1;padding-bottom:4px}
+      .bar .q{flex:1;font-size:36px;font-weight:600;color:#16181d;letter-spacing:-.3px;white-space:nowrap}
+      .foot{margin-top:14px;padding-left:14px;font-size:24px;color:rgba(255,255,255,.88);
+        text-shadow:0 2px 9px rgba(0,0,0,.7)}
+      .foot b{font-weight:700;color:#fff}`,
+    block: (m) => `<div class="fade"></div><div class="wrap">
+      <div class="bar"><span class="ya">Я</span><span class="q">нейронка про ${m}</span>${lens('#a8a8ae', 32)}</div>
+      <div class="foot">просто наберите в поиске · <b>neironka.pro</b> · бесплатно</div></div>`,
+  },
+};
+
+// ═══ ПЯТЬ СТИЛЕЙ БЕЗ СТРОКИ ПОИСКА ═══════════════════════════════════════════════════════════
+const OTHER = {
+  // Д1. Две строки, слово-запрос выделено маркером. Самый «рилсовый» вид: крупно и читаемо даже
+  // в мелком превью ленты.
+  'txt-marker': {
+    n: 1, group: 'other', name: 'две строки, запрос выделен маркером',
+    css: (t) => `${fade(t, 500, 0.6)}
+      .wrap{position:absolute;left:${SIDE - 10}px;right:${SIDE - 10}px;bottom:${BOTTOM}px;
+        text-align:center;color:#fff}
+      .a{font-size:44px;font-weight:800;letter-spacing:-.5px;line-height:1.2;
+        text-shadow:0 3px 14px rgba(0,0,0,.75)}
+      .b{margin-top:16px;font-size:44px;font-weight:800;letter-spacing:-.5px;line-height:1.34}
+      .b i{font-style:normal;background:#a06cff;color:#fff;padding:6px 14px 8px;border-radius:10px;
+        box-shadow:0 8px 22px rgba(0,0,0,.35)}
+      .c{margin-top:18px;font-size:26px;font-weight:500;color:rgba(255,255,255,.9);
+        text-shadow:0 2px 10px rgba(0,0,0,.7)}`,
+    block: (m) => `<div class="fade"></div><div class="wrap">
+      <div class="a">хочешь такой же кадр?</div>
+      <div class="b">в яндексе: <i>нейронка про ${m}</i></div>
+      <div class="c">neironka.pro · первые генерации бесплатно</div></div>`,
+  },
+
+  // Д2. Наклейка: белая карточка с наклоном и булавкой. Читается как приписка от себя, а не как
+  // реклама, и не закрывает низ кадра целиком.
+  'sticker': {
+    n: 2, group: 'other', name: 'наклейка-стикер с булавкой',
+    // Булавка живёт НАД карточкой (z-index) и стоит на её верхнем крае: при равном z-index
+    // наклонённая карточка накрывала булавку и её просто не было видно на кадре.
+    css: () => `.st{position:absolute;left:${SIDE}px;bottom:${BOTTOM}px;transform:rotate(-2.6deg);
+        background:#fff;color:#141018;padding:28px 38px 24px;border-radius:20px;max-width:790px;
+        box-shadow:0 18px 46px rgba(0,0,0,.44);z-index:1}
+      .st .a{font-size:38px;font-weight:800;letter-spacing:-.4px;line-height:1.16}
+      .st .b{margin-top:12px;font-size:27px;font-weight:700;color:#7a4bd6;line-height:1.24;
+        white-space:nowrap}
+      .st .c{margin-top:12px;padding-top:12px;border-top:2px solid rgba(0,0,0,.08);
+        font-size:23px;font-weight:600;color:#8a8a92}
+      .pin{position:absolute;left:${SIDE + 44}px;bottom:${BOTTOM + 232}px;width:26px;height:26px;
+        border-radius:50%;background:#a06cff;box-shadow:0 4px 12px rgba(0,0,0,.45);
+        border:4px solid rgba(255,255,255,.92);z-index:2}`,
+    block: (m) => `<div class="pin"></div><div class="st">
+      <div class="a">делала себе тут,<br>это бесплатно</div>
+      <div class="b">в яндексе: нейронка про ${m}</div>
+      <div class="c">neironka.pro</div></div>`,
+  },
+
+  // Д3. Полоса по низу кадра: домен крупно слева, инструкция мелко справа. Строгий вариант,
+  // выглядит как подпись бренда, а не как надпись поверх фото.
+  'band': {
+    n: 3, group: 'other', name: 'полоса по низу кадра: домен и инструкция',
+    // ПОЛОСА ДОХОДИТ ДО САМОГО НИЗА КАДРА, а не висит в воздухе. Первая сборка ставила её на
+    // 180 px от низа, и под ней снова появлялась фотография: поперёк кадра шли ДВА шва, верхний
+    // и нижний. Теперь низ полосы совпадает с низом кадра, шов только один и он оформлен
+    // акцентной линией, а текст всё равно стоит выше 240 px от края.
+    css: (t) => `.band{position:absolute;left:0;right:0;bottom:0;
+        padding:26px ${SIDE}px ${BOTTOM}px;display:flex;align-items:center;gap:26px;color:#fff;
+        background:linear-gradient(to bottom,${rgba(t, 0.9)} 0%,${rgba(t, 0.82)} 100%);
+        border-top:3px solid #a06cff}
+      .band:before{content:'';position:absolute;left:0;right:0;bottom:100%;height:190px;
+        background:linear-gradient(to top,${rgba(t, 0.72)} 0%,${rgba(t, 0)} 100%)}
+      .band .d{font-size:46px;font-weight:900;letter-spacing:-1.2px;line-height:1}
+      .band .v{width:2px;align-self:stretch;background:rgba(255,255,255,.22)}
+      .band .r{font-size:25px;line-height:1.34;color:rgba(255,255,255,.92)}
+      .band .r b{font-weight:700;color:#fff}`,
+    block: (m) => `<div class="band"><div class="d">neironka.pro</div><div class="v"></div>
+      <div class="r">ищи <b>«нейронка про ${m}»</b><br>в яндексе · попытки бесплатные</div></div>`,
+  },
+
+  // Д4. Рукописная подпись с подчёркиванием от руки. Живее всего смотрится на тёмном кадре и
+  // совсем не похожа на плашку.
+  'hand': {
+    n: 4, group: 'other', name: 'рукописная подпись с подчёркиванием',
+    css: (t) => `${fade(t, 460, 0.58)}
+      .wrap{position:absolute;left:${SIDE}px;right:${SIDE}px;bottom:${BOTTOM}px;color:#fff}
+      /* Наклон на полтора градуса: подпись читается как приписка от руки, а не как строка вёрстки.
+         Текст держим в ДВЕ строки: на трёх последнее слово оставалось одно на строке и это
+         выглядело как брак переноса. */
+      .wrap{transform:rotate(-1.5deg)}
+      .h{font-family:'Bradley Hand','Snell Roundhand',cursive;font-size:50px;font-weight:700;
+        line-height:1.26;letter-spacing:.4px;text-shadow:0 3px 14px rgba(0,0,0,.7)}
+      .h em{font-style:normal;color:#e6d5ff}
+      .un{margin-top:4px}
+      .foot{margin-top:14px;font-size:25px;font-weight:500;color:rgba(255,255,255,.88);
+        text-shadow:0 2px 9px rgba(0,0,0,.7);font-family:-apple-system,'Helvetica Neue',Arial,sans-serif}
+      .foot b{font-weight:700;color:#fff}`,
+    block: (m) => `<div class="fade"></div><div class="wrap">
+      <div class="h">сделала сама за минуту)<br>искала <em>«нейронка про ${m}»</em></div>
+      <div class="un"><svg width="620" height="26" viewBox="0 0 620 26" fill="none">
+        <path d="M6 17C120 6 300 5 420 12c60 3 130 8 194 2" stroke="#c9a4ff" stroke-width="6"
+          stroke-linecap="round"/></svg></div>
+      <div class="foot"><b>neironka.pro</b> · попытки бесплатные</div></div>`,
+  },
+
+  // Д5. Круглый бейдж в углу: печать «ищи в яндексе». Занимает минимум кадра, лицо не задевает,
+  // но и текста вмещает меньше всех.
+  'badge': {
+    n: 5, group: 'other', name: 'круглый бейдж-печать в углу',
+    css: (t) => `${fade(t, 400, 0.5)}
+      .bg{position:absolute;right:${SIDE}px;bottom:${BOTTOM}px;width:330px;height:330px;
+        border-radius:50%;background:rgba(16,16,22,.56);border:2.5px solid rgba(255,255,255,.34);
+        -webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);color:#fff;
+        display:flex;flex-direction:column;align-items:center;justify-content:center;
+        text-align:center;padding:0 30px;box-shadow:0 18px 46px rgba(0,0,0,.44)}
+      .bg .k{font-size:21px;font-weight:700;letter-spacing:3px;text-transform:uppercase;
+        color:rgba(255,255,255,.74)}
+      .bg .q{margin-top:12px;font-size:34px;font-weight:800;line-height:1.16;letter-spacing:-.4px}
+      .bg .l{margin-top:14px;width:56px;height:2px;background:rgba(255,255,255,.34)}
+      .bg .d{margin-top:14px;font-size:23px;font-weight:600;color:rgba(255,255,255,.9)}
+      .side{position:absolute;left:${SIDE}px;bottom:${BOTTOM + 30}px;width:420px;color:#fff}
+      .side .a{font-size:36px;font-weight:800;line-height:1.2;letter-spacing:-.4px;
+        text-shadow:0 3px 14px rgba(0,0,0,.75)}`,
+    block: (m) => `<div class="fade"></div>
+      <div class="side"><div class="a">повторить<br>можно бесплатно</div></div>
+      <div class="bg"><div class="k">ищи в яндексе</div><div class="q">нейронка<br>про ${m}</div>
+        <div class="l"></div><div class="d">neironka.pro</div></div>`,
+  },
+};
+
+const PLATES = { ...YA, ...OTHER };
+const YA_KEYS = Object.keys(YA);
+const OTHER_KEYS = Object.keys(OTHER);
+
+// ═══ РЕНДЕР ══════════════════════════════════════════════════════════════════════════════════
+// Работаем во вкладке статичного headless Chrome проекта (adminbrowser): своих браузеров не
+// поднимаем, окон в доке не появляется. Размер вкладки задаём сами, потому что склейка-каталог
+// шире и выше одного кадра.
+/**
+ * ПРЕДОХРАНИТЕЛЬ НА ВЕСЬ РЕНДЕР (25.08).
+ *
+ * Внутри уже стоят три таймаута по 120 секунд: на подключение, на setContent и
+ * на скриншот. Беда в том, что они СКЛАДЫВАЮТСЯ, а очередь за единственной
+ * вкладкой к ним не относится вовсе: вызов может простоять в ожидании вкладки
+ * сколько угодно и ни один внутренний таймаут не сработает.
+ *
+ * Цена этого: за один день главный чат трижды вставал намертво на нанесении
+ * хука, и владельцу пришлось перезагружать ноутбук. Внутренние таймауты в тот
+ * момент были на месте и не помогли, потому что висело ДО них.
+ *
+ * Поэтому здесь общий потолок на весь вызов: не уложились, честно падаем с
+ * понятной ошибкой. Упавший рендер это минус одна картинка, а вставший намертво
+ * процесс это минус рабочий день.
+ */
+const РЕНДЕР_ПОТОЛОК_МС = Number(process.env.PLATES_RENDER_MS || 180000);
+
+async function renderHtml(html, out, w = W, h = H) {
+  let сторож;
+  const потолок = new Promise((_, отказ) => {
+    сторож = setTimeout(
+      () => отказ(new Error(`рендер не уложился в ${Math.round(РЕНДЕР_ПОТОЛОК_МС / 1000)} с (вкладка занята или хром завис): ${out}`)),
+      РЕНДЕР_ПОТОЛОК_МС,
+    );
+  });
+  try {
+    return await Promise.race([рендерВнутри(html, out, w, h), потолок]);
+  } finally { clearTimeout(сторож); }
+}
+
+async function рендерВнутри(html, out, w = W, h = H) {
+  const { openAdmin } = require('./adminbrowser.cjs');
+  const { page, done } = await openAdmin();
+  try {
+    await page.setViewportSize({ width: w, height: h });
+    // ТАЙМАУТ 120 СЕКУНД (14.08). Это ТРЕТИЙ рендер в проекте с тем же вызовом (первые два —
+    // slidekit и ttkit, там подняли утром), и он тоже стоял на умолчании 30 секунд. Хром у фермы
+    // один на всех: под двумя пачками резки и сборкой постов карточка не успевала отрисоваться,
+    // и cardgen падал с «page.setContent: Timeout 30000ms». Настоящий висяк ловят сторожа выше.
+    // Метка своей страницы: уникальная на вызов, живёт в data-атрибуте корня.
+    const метка = `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const сМеткой = html.replace(/<html(\s|>)/i, (m, x) => `<html data-plates="${метка}"${x}`);
+    const готовый = сМеткой === html ? `<html data-plates="${метка}">${html}</html>` : сМеткой;
+    await page.setContent(готовый, { waitUntil: 'load', timeout: 120000 });
+    await page.waitForTimeout(350);
+    const png = out.replace(/\.jpe?g$/i, '.png');
+    await page.screenshot({ path: png, fullPage: false, timeout: 120000 });
+
+    // ПРОВЕРКА, ЧТО СНЯЛИ ИМЕННО СВОЮ СТРАНИЦУ (25.08).
+    //
+    // Браузер один на всех, и при контенции за вкладку скриншот молча снимается
+    // с ЧУЖОЙ страницы, а вызов возвращает успех. Живой случай: рендер хука
+    // отдал логотип сайта вместо фотографии девочки за 2 секунды, отчитался
+    // успехом, и брак уехал в готовый ролик незамеченным. Упавший рендер видно
+    // сразу, а подменённый не видно вообще, и это хуже.
+    //
+    // Метим страницу перед съёмкой и сверяем после: если метки нет, снимали не
+    // нас. Стоит это один вызов evaluate, то есть ничего.
+    const наша = await page.evaluate(() => document.documentElement.dataset.plates || '').catch(() => '');
+    if (наша !== метка) {
+      throw new Error(`рендер снял ЧУЖУЮ вкладку (метка «${наша}» вместо «${метка}»): браузер занят другим вызовом, повтори позже`);
+    }
+    execFileSync(FF, ['-y', '-i', png, '-q:v', '2', out], { stdio: 'ignore' });
+    fs.unlinkSync(png);
+  } finally { await done(); }
+  return out;
+}
+
+const b64of = (f) => ({ b64: fs.readFileSync(f).toString('base64'),
+  mime: /\.png$/i.test(f) ? 'image/png' : 'image/jpeg' });
+
+/**
+ * Кадр 4 с выбранной плашкой.
+ * @param {string} src кадр 4:5 (если не 4:5, приводим обрезкой)
+ * @param {string} out куда положить jpeg
+ * @param {object} o {style, platform='reels', cover}
+ */
+async function platePlate(src, out, o = {}) {
+  const style = String(o.style || 'ya-real');
+  const st = PLATES[style];
+  if (!st) throw new Error(`plates: нет стиля «${style}», есть: ${Object.keys(PLATES).join(', ')}`);
+  const platform = o.platform || 'reels';
+  const marker = require('./templates.cjs').frame4Marker(platform);
+  // Кадр приводим к 4:5 функцией слидкита: один способ обрезки на весь проект.
+  const base = out.replace(/(\.\w+)$/, '_base$1');
+  require('./slidekit.cjs').to45(src, base);
+  const { b64, mime } = b64of(base);
+  const t = tone(o.cover && fs.existsSync(o.cover) ? o.cover : base);
+  const html = `<!doctype html><meta charset="utf-8"><style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{width:${W}px;height:${H}px;position:relative;overflow:hidden;background:#000;
+      font-family:-apple-system,'Helvetica Neue',Arial,sans-serif;-webkit-font-smoothing:antialiased}
+    img{width:${W}px;height:${H}px;object-fit:cover;display:block}
+    ${typeof st.css === 'function' ? st.css(t) : st.css}
+  </style><img src="data:${mime};base64,${b64}">${st.block(marker)}`;
+  await renderHtml(html, out);
+  if (!o.keepBase) { try { fs.unlinkSync(base); } catch {} }
+  return { out, style, name: st.name, platform, marker };
+}
+
+// ═══ СКЛЕЙКА-КАТАЛОГ ═════════════════════════════════════════════════════════════════════════
+// Пять стилей строками, кадры столбцами, номер варианта нарисован прямо на склейке: начальник
+// выбирает с телефона по цифре. Тоже HTML, чтобы не заводить шрифты в ffmpeg drawtext.
+async function catalogSheet(rows, out, title) {
+  const TW = 340, TH = Math.round(TW * H / W);      // плитка 340×425
+  const cols = rows[0].shots.length;
+  const html = `<!doctype html><meta charset="utf-8"><style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{width:${cols * TW + 46 + (cols - 1) * 10}px;background:#0e0e12;color:#fff;padding:22px;
+      font-family:-apple-system,'Helvetica Neue',Arial,sans-serif;-webkit-font-smoothing:antialiased}
+    h1{font-size:30px;font-weight:800;letter-spacing:-.4px;margin-bottom:4px}
+    .sub{font-size:17px;color:#9a9aa4;margin-bottom:20px}
+    .row{margin-bottom:22px}
+    .cap{display:flex;align-items:center;gap:12px;margin-bottom:9px}
+    .num{width:38px;height:38px;border-radius:11px;background:#a06cff;color:#fff;flex:0 0 auto;
+      display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:800}
+    .nm{font-size:20px;font-weight:700}
+    .key{font-size:15px;color:#8b8b95}
+    .tiles{display:flex;gap:10px}
+    .tiles img{width:${TW}px;height:${TH}px;object-fit:cover;border-radius:10px;display:block}
+  </style><h1>${title}</h1><div class="sub">кадры: тёмный в постели · светлый уличный · светлый холл</div>
+  ${rows.map((r) => `<div class="row"><div class="cap"><span class="num">${r.n}</span>
+    <span class="nm">${r.name}</span><span class="key">${r.key}</span></div>
+    <div class="tiles">${r.shots.map((f) => {
+      const { b64, mime } = b64of(f);
+      return `<img src="data:${mime};base64,${b64}">`;
+    }).join('')}</div></div>`).join('')}`;
+  const wpx = cols * TW + 46 + (cols - 1) * 10;
+  // Высота с запасом 34 px: без него нижнее поле страницы съедалось и последний ряд плиток
+  // упирался в самый край склейки.
+  const hpx = 22 * 2 + 68 + rows.length * (TH + 22 + 47) + 34;
+  return renderHtml(html, out, wpx, hpx);
+}
+
+module.exports = { PLATES, YA_KEYS, OTHER_KEYS, platePlate, catalogSheet, renderHtml, tone, W, H, BOTTOM, SIDE };
+
+// ═══ CLI ═════════════════════════════════════════════════════════════════════════════════════
+if (require.main === module) {
+  const arg = (k, d) => { const i = process.argv.indexOf('--' + k); return i > 0 ? process.argv[i + 1] : d; };
+  (async () => {
+    if (process.argv.includes('--one')) {
+      const r = await platePlate(arg('src'), arg('out', '/tmp/plate.jpg'),
+        { style: arg('one'), platform: arg('platform', 'reels') });
+      console.log(JSON.stringify(r, null, 2));
+      return;
+    }
+    const outDir = arg('dir', '/Users/qq/Desktop/ПЛАШКИ-ВАРИАНТЫ');
+    const srcs = (arg('frames') || [
+      '/Users/qq/Desktop/ТЁМНЫЙ-И-НЕОН/ТЁМНАЯ_5_тёмная_в_постели__060.jpg',
+      '/Users/qq/Desktop/КАЧЕСТВО-ЛУЧШИЕ-10.08/P13_566883fb_кадр3.jpg',
+      '/Users/qq/Desktop/КАЧЕСТВО-ЛУЧШИЕ-10.08/P11_d01c49a5_кадр3.jpg',
+    ].join(',')).split(',');
+    fs.mkdirSync(outDir, { recursive: true });
+    // --only ya-real,sticker: перерисовать ТОЛЬКО эти стили. Склейки всё равно собираются из всех
+    // десяти файлов на диске, поэтому мелкая правка одного стиля не стоит тридцати рендеров.
+    const only = arg('only') ? new Set(String(arg('only')).split(',')) : null;
+    const made = {};
+    for (const key of Object.keys(PLATES)) {
+      made[key] = [];
+      for (let i = 0; i < srcs.length; i++) {
+        const out = path.join(outDir, `${PLATES[key].group === 'ya' ? 'Я' : 'Д'}${PLATES[key].n}_${key}_кадр${i + 1}.jpg`);
+        made[key].push(out);
+        if (only && !only.has(key)) continue;
+        const r = await platePlate(srcs[i], out, { style: key, platform: arg('platform', 'reels') });
+        console.log('  готово', path.basename(r.out));
+      }
+    }
+    const rowsOf = (keys) => keys.map((k) => ({ n: PLATES[k].n, name: PLATES[k].name, key: k, shots: made[k] }));
+    const c1 = await catalogSheet(rowsOf(YA_KEYS), path.join(outDir, 'КАТАЛОГ-1-ЯНДЕКС.jpg'),
+      'Плашка со строкой яндекса, 5 вариантов');
+    const c2 = await catalogSheet(rowsOf(OTHER_KEYS), path.join(outDir, 'КАТАЛОГ-2-ДРУГИЕ.jpg'),
+      'Плашка без строки поиска, 5 вариантов');
+    console.log('склейки:', c1, c2);
+  })().catch((e) => { console.error(e); process.exit(1); });
+}

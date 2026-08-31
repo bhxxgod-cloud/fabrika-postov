@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Нейронка · Постер — вход</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, system-ui, sans-serif;
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg, #f3f1fd 0%, #eef4fb 55%, #f6eefb 100%); }
+  .card { background: #fff; border: 1px solid #e6e3f0; border-radius: 16px; padding: 2rem;
+    width: 320px; box-shadow: 0 10px 40px rgba(83,74,183,0.08); }
+  h1 { font-size: 18px; font-weight: 500; margin: 0 0 1.25rem; color: #2c2a3a; }
+  input { width: 100%; height: 40px; padding: 0 12px; border: 1px solid #ddd9ec; border-radius: 8px;
+    font-size: 14px; margin-bottom: 12px; }
+  button { width: 100%; height: 40px; border: none; border-radius: 8px; background: #534ab7;
+    color: #fff; font-size: 14px; cursor: pointer; }
+  .err { color: #a32d2d; font-size: 13px; min-height: 18px; }
+</style>
+</head>
+<body>
+  <form class="card" onsubmit="return login(event)">
+    <h1>Нейронка · Постер</h1>
+    <input id="pw" type="password" placeholder="Пароль" autofocus />
+    <div class="err" id="err"></div>
+    <button type="submit">Войти</button>
+  </form>
+<script>
+async function login(e) {
+  e.preventDefault();
+  const r = await fetch('/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: document.getElementById('pw').value }) });
+  if (r.ok) location.href = '/';
+  else document.getElementById('err').textContent = 'Неверный пароль';
+  return false;
+}
+</script>
+</body>
+</html>

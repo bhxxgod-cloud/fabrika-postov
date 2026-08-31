@@ -1,0 +1,471 @@
+// ttkit.cjs — СБОРКА КАДРОВ ПОД ТИКТОК (9:16, 1080×1920). НОВЫЙ путь, отдельный от инстаграмного.
+//
+// ЗАЧЕМ. slidekit.cjs собирает кадры 4:5 (1080×1350) под инстаграм, и это правильно для инстаграма.
+// Начальник грузит ТЕ ЖЕ кадры в фотокарусель тиктока и ловит «кадр слишком вверх ушёл». Причина
+// разложена в двух местах, и обе надо лечить здесь, а не в slidekit:
+//
+//   1. ФОРМАТ. Тикток это лента 9:16. Наш кадр 4:5 по пропорции 0.8, тиктоковский 0.5625. То есть
+//      по высоте мы отдаём ровно 70.3% того, что ждёт площадка: 1350 из 1920 при ширине 1080.
+//      Кто хочет закрыть экран целиком нашим кадром, обязан срезать 29.7% ШИРИНЫ (по 14.8% с бока).
+//   2. КОМПОЗИЦИЯ. В кадре 1 лицо у нас стоит ОЧЕНЬ высоко: замер по 15 готовым постам (yunet)
+//      даёт центр лица по вертикали от 13.9% до 39.7% высоты кадра, медиана 27.1%, а верх рамки
+//      лица доходит до 2.7%. В инстаграме над картинкой ничего не лежит, и это сходит. В тиктоке
+//      сверху стоит своя полоса интерфейса, и голова уезжает под неё. Отсюда «ушёл вверх».
+//
+// ЧТО ДЕЛАЕМ. Кадр СТРОИМ в 9:16, а не приводим постфактум:
+//   · фото масштабируем ПО ШИРИНЕ до 1080 и кладём ЦЕЛИКОМ, ничего не срезая по бокам;
+//   · остаток высоты закрываем РАЗМЫТОЙ затемнённой копией того же кадра. Это не белое поле и не
+//     чёрная полоса (запрет начальника 09.08 на белые края), это стандартный вид ленты;
+//   · вертикального сжатия НЕТ ни в одной ветке (дважды пойманное «растянутое лицо», 09.08);
+//   · вертикальный сдвиг фото выбираем ПО ЛИЦУ: центр лица уводим в 30-34% высоты экрана, чтобы
+//     голова не попала под верхнюю полосу интерфейса;
+//   · весь наш текст (хук, финальная плашка) живёт ВНУТРИ безопасной зоны, а не по краю кадра.
+//
+// ЧЕГО ЗДЕСЬ НЕТ. Заказов генерации, работы с базой, отправки в телеграм. Модуль только собирает
+// кадры из уже готовых файлов.
+//
+// ЗАПУСК
+//   node ttkit.cjs --frames /tmp/tgreview_XXXX --out /tmp/tt_out --hook "текст хука"
+//   node ttkit.cjs --frames /tmp/tgreview_XXXX --out /tmp/tt_out          (хук берётся из hook.txt, если есть)
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const { execFileSync, spawnSync } = require('node:child_process');
+const FF = require('ffmpeg-static');
+
+// ═══ ФОРМАТ ТИКТОКА ══════════════════════════════════════════════════════════════════════════
+// 1080×1920 это канонический размер вертикали тиктока: он же в спеках рекламного кабинета, он же
+// в справке по загрузке. Соотношение 9:16.
+const W = 1080, H = 1920;
+
+// БЕЗОПАСНАЯ ЗОНА. Тут было расхождение между двумя источниками, и 10.08 оно закрыто в пользу
+// более широких полей. Что было и что стало:
+//
+//   · РАНЬШЕ (130 / 483 / 44 / 140) — числа из текстового гайда по креативам рекламного кабинета.
+//   · ТЕПЕРЬ (240 / 660 / 120 / 140) — измерено СВОИМИ РУКАМИ по официальному шаблону ленты
+//     тиктока (их же CDN, файл In-Feed/Feed.png, 2880×5120): в шаблоне интерфейс нарисован, и
+//     границы читаются по альфа-каналу, а не по чьему-то пересказу. Пересчёт на наш 1080×1920
+//     даёт сверху 240, снизу 660, по бокам 120.
+//
+// ПОЧЕМУ БЕРЁМ ХУДШЕЕ ИЗ ДВУХ ПО КАЖДОЙ СТОРОНЕ, а не спорим, какой источник вернее: широкие
+// поля вкладываются в узкие. Текст, который влез в 240/660, тем более влезет в 130/483, поэтому
+// ошибка в эту сторону невозможна в принципе. Обратный выбор рисковал бы надписью под
+// интерфейсом. Справа оставляем 140 (колонка кнопок из гайда шире измеренных 120).
+//
+// Держим их как ЕДИНСТВЕННОЕ место, где эти цифры записаны, чтобы не разъехались по файлам.
+const SAFE = {
+  top: 240,      // поиск и переключатель «Подписки | Для вас»
+  bottom: 660,   // ник, подпись, музыка, точки карусели, панель комментария
+  left: 120,     // левый край подписи
+  right: 140,    // колонка справа: аватар, лайк, комментарий, поделиться, пластинка
+};
+const CLEAN_TOP = SAFE.top;                 // 240
+const CLEAN_BOTTOM = H - SAFE.bottom;       // 1260
+const CLEAN_H = CLEAN_BOTTOM - CLEAN_TOP;   // 1020 px чистой высоты, 53.1% экрана
+
+// ═══ ЗАМЕР ЛИЦА ══════════════════════════════════════════════════════════════════════════════
+// Тот же детектор, каким проект мерит лица в кадрах: cv2.FaceDetectorYN с моделью yunet.onnx.
+// Модель ЧИТАЕМ из корня проекта, ничего в неё не пишем. Если детектор недоступен, сборка не
+// падает: вертикальный сдвиг берётся базовый, просто без наводки по лицу.
+const YUNET = process.env.YUNET || path.join(__dirname, 'yunet.onnx');
+const PY = `
+import sys, json, cv2
+p = sys.argv[1]
+img = cv2.imread(p)
+h, w = img.shape[:2]
+d = cv2.FaceDetectorYN_create(sys.argv[2], '', (w, h), 0.5, 0.3, 200)
+d.setInputSize((w, h))
+_, f = d.detect(img)
+out = []
+if f is not None:
+    for r in f:
+        out.append([float(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[-1])])
+out.sort(key=lambda t: -t[2] * t[3])
+print(json.dumps({'w': w, 'h': h, 'faces': out}))
+`;
+// ДЕТЕКТОР ЛИЦА ЧЕРЕЗ macOS Vision (25.08). cv2/opencv в системе не ставится (PEP 668, py3.14),
+// поэтому питон-yunet всегда пуст, и кропы карточек падали в портрет. Бинарь ~/.neironka/bin/facebox
+// (swift+Vision) отдаёт рамку и 5 точек без установок. Используем как фоллбэк к yunet.
+function faceBoxVision(src) {
+  try {
+    const FB = require('os').homedir() + '/.neironka/bin/facebox';
+    if (!fs.existsSync(FB)) return null;
+    const r = spawnSync(FB, [src], { encoding: 'utf8', maxBuffer: 1 << 22 });
+    const line = String(r.stdout || '').trim().split('\n').filter((s) => s.startsWith('{')).pop();
+    if (!line) return null;
+    const j = JSON.parse(line);
+    if (!j.face) return j.w ? { w: j.w, h: j.h, face: null } : null;
+    const f = j.face;
+    return { w: j.w, h: j.h, face: { x: f.x, y: f.y, w: f.w, h: f.h, cy: (f.y + f.h / 2) / j.h, top: f.y / j.h } };
+  } catch { return null; }
+}
+function faceBox(src) {
+  if (fs.existsSync(YUNET)) {
+    try {
+      const r = spawnSync('python3', ['-c', PY, src, YUNET], { encoding: 'utf8', maxBuffer: 1 << 22 });
+      const line = String(r.stdout || '').trim().split('\n').filter((s) => s.startsWith('{')).pop();
+      if (line) {
+        const j = JSON.parse(line);
+        if (j.faces && j.faces.length) {
+          const [x, y, fw, fh] = j.faces[0];
+          return { w: j.w, h: j.h, face: { x, y, w: fw, h: fh, cy: (y + fh / 2) / j.h, top: y / j.h } };
+        }
+        // питон отработал, но лица нет — пробуем Vision, вдруг найдёт
+      }
+    } catch { /* питон/cv2 недоступен — идём в Vision */ }
+  }
+  return faceBoxVision(src);
+}
+
+function probeSize(src) {
+  const r = spawnSync(FF, ['-hide_banner', '-i', src], { encoding: 'utf8' });
+  const m = String(r.stderr || '').match(/,\s(\d{2,5})x(\d{2,5})[\s,]/);
+  return m ? { w: +m[1], h: +m[2] } : null;
+}
+
+// ═══ ПРИВЕДЕНИЕ К 9:16 ═══════════════════════════════════════════════════════════════════════
+// Фото ЦЕЛИКОМ по ширине 1080, остаток высоты закрыт размытой затемнённой копией того же кадра.
+// Ни обрезки по бокам, ни вертикального сжатия, ни белых полей.
+//
+// ГДЕ ПО ВЕРТИКАЛИ (пересчитано 10.08 вместе с безопасной зоной).
+//
+// Прежняя база «низ фото на границу нижнего интерфейса» жила на старых числах: при полях 483 она
+// давала сдвиг 87 px и полосу размытия, полностью укрытую верхним интерфейсом. С измеренными
+// полями 660 та же формула даёт ОТРИЦАТЕЛЬНЫЙ сдвиг, который упирался в ноль, то есть фото
+// прижималось к самому верху экрана и голова уезжала ровно под верхнюю полосу. Это и есть
+// «кадр слишком вверх ушёл», от которого мы лечимся, только в новой оправе.
+//
+// НОВАЯ БАЗА: полосы размытия СИММЕТРИЧНЫ, фото по центру экрана. При 1080×1350 это 285 px
+// сверху и 285 снизу. Причины именно так:
+//   · симметрия читается как задумка, а односторонняя полоса как брак сборки;
+//   · центр лица при медианном кадре встаёт на 33.9% высоты экрана, то есть внутри чистой зоны
+//     240..1260 и заметно ниже верхнего интерфейса — то, что нам и нужно;
+//   · низ фото (1635) уходит под нижний интерфейс, но там одежда и фон, терять не жалко.
+// Полосы видны, и это нормальный вид фотопоста в тиктоке: размытая копия кадра, а не белое поле
+// и не чёрная полоса (запрет начальника 09.08 именно на белые края).
+//
+// Дальше правка по лицу: если верх рамки лица всё равно оказался выше, чем 40 px под кромкой
+// верхнего интерфейса, опускаем фото, но не глубже CLEAN_TOP + 200.
+function plan916(src) {
+  const sz = probeSize(src) || { w: 1080, h: 1350 };
+  const fgH = Math.round((W * sz.h) / sz.w / 2) * 2;   // чётная высота: ffmpeg не любит нечётные
+  const fits = fgH <= H;
+  const room = Math.max(0, H - fgH);
+  let off = Math.round(room / 2);                      // база 285 при fgH = 1350
+  const fb = faceBox(src);
+  const face = fb && fb.face ? fb.face : null;
+  let nudged = 0;
+  if (fits && face) {
+    const faceTop = off + face.top * fgH;
+    const want = CLEAN_TOP + 40;
+    if (faceTop < want) {
+      const maxOff = Math.min(room, CLEAN_TOP + 200);
+      const next = Math.min(maxOff, off + (want - faceTop));
+      nudged = Math.round(next - off);
+      off = Math.round(next);
+    }
+  }
+  return {
+    src, srcW: sz.w, srcH: sz.h, fgH, fits, off: Math.round(off), nudged,
+    faceCy: face ? +(face.cy).toFixed(3) : null,
+    faceCyCanvas: face && fits ? +((off + face.cy * fgH) / H).toFixed(3) : null,
+    imgTop: Math.round(off), imgBottom: Math.round(off + fgH),
+  };
+}
+
+// ═══ КАРТОЧКА В 9:16 ════════════════════════════════════════════════════════════════════════
+// ОТДЕЛЬНЫЙ режим для кадров-КАРТОЧЕК (разбор внешности, бьюти-гайд, цветотип). Почему нельзя
+// гнать их через to916, хотя формат тот же:
+//
+//   Карточку рисует фабрика, и текст в ней идёт от края до края всей высоты 1350. Наша чистая
+//   зона в тиктоке 1020 px. Значит при обычной укладке нижняя треть карточки, а это целые блоки
+//   с оценками, физически оказывается под подписью, музыкой и точками карусели. Проверено
+//   глазами на посте 89157610: у карточки «оценка привлекательности» и без тиктока последний
+//   блок уже подрезан кропом 4:5, а в 9:16 пропадал бы весь.
+//
+// ПОЭТОМУ: карточку ВПИСЫВАЕМ целиком в чистую зону (contain), а не укладываем по ширине. Она
+// становится меньше (816 px по ширине вместо 1080, то есть 75.6%), зато читается вся и целиком
+// на виду. Поля закрывает та же размытая копия, никаких белых краёв.
+//
+// Текст на карточке мелкий, поэтому размытие фона делаем СИЛЬНЕЕ и темнее, чем у фото: иначе
+// узор просвечивает вплотную к строкам и мешает читать.
+const CARD_W = Math.round((W * CLEAN_H) / 1350 / 2) * 2;   // 816 при исходнике 4:5
+
+// ФОН ПОД КАРТОЧКОЙ БЕРЁМ С ОБЛОЖКИ ПОСТА (opts.bg), а не с самой карточки. Проверено глазами
+// 10.08: карточка светло-серая, её размытие даёт ровную серую стену, и слайд читается как
+// заглушка или ошибка загрузки. Размытая обложка того же поста выглядит задуманно и связывает
+// слайд с постом. Если обложки не дали, честно падаем на саму карточку.
+function cardTo916(src, out, opts = {}) {
+  const sz = probeSize(src) || { w: 1080, h: 1350 };
+  // Вписываем по ТОЙ стороне, которая упирается первой. Для 4:5 это высота.
+  const k = Math.min(W / sz.w, CLEAN_H / sz.h);
+  const cw = Math.round((sz.w * k) / 2) * 2;
+  const ch = Math.round((sz.h * k) / 2) * 2;
+  const x = Math.round((W - cw) / 2);
+  const y = CLEAN_TOP + Math.round((CLEAN_H - ch) / 2);
+  const bgSrc = opts.bg && fs.existsSync(opts.bg) ? opts.bg : src;
+  const args = ['-y', '-i', bgSrc];
+  if (bgSrc !== src) args.push('-i', src);
+  const fgIn = bgSrc !== src ? '1:v' : '0:v';
+  const fc = [
+    `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},`
+      + `boxblur=60:3,eq=brightness=-0.30:saturation=0.55[bg]`,
+    `[${fgIn}]scale=${cw}:${ch}[fg]`,
+    `[bg][fg]overlay=${x}:${y}[v]`,
+  ].join(';');
+  execFileSync(FF, [...args, '-filter_complex', fc, '-map', '[v]', '-q:v', '2', out],
+    { stdio: 'ignore' });
+  return { src, out, kind: 'карточка', srcW: sz.w, srcH: sz.h, bg: path.basename(bgSrc),
+    cardW: cw, cardH: ch, x, y, insideClean: y >= CLEAN_TOP && y + ch <= CLEAN_BOTTOM,
+    scalePct: +(k * 100).toFixed(1) };
+}
+
+// Собственно кадр 9:16 из одной картинки. Возвращает план (нужен вёрстке текста).
+function to916(src, out, opts = {}) {
+  const p = plan916(src);
+  // РЕЖИМ «ЗАЛИТЬ ЭКРАН» (11.08, приказ «никаких полей»). Фото режем по бокам и заполняем весь
+  // кадр. Текст в таком кадре мы НАНОСИМ ЗАНОВО поверх уже 9:16, поэтому обрезать нечего: на входе
+  // ждём ЧИСТЫЙ кадр без надписей.
+  if (opts.fill) {
+    execFileSync(FF, ['-y', '-i', src, '-vf',
+      `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}`,
+      '-q:v', '2', out], { stdio: 'ignore' });
+    return { ...p, out, режим: 'залить' };
+  }
+  if (!p.fits) {
+    // Источник ВЫШЕ 9:16 (например 1080×2400): полосы не нужны, режем по центру без сжатия.
+    execFileSync(FF, ['-y', '-i', src, '-vf',
+      `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}`,
+      '-q:v', '2', out], { stdio: 'ignore' });
+    return { ...p, out };
+  }
+  const fc = [
+    `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},`
+      + `boxblur=42:2,eq=brightness=-0.16:saturation=0.72[bg]`,
+    `[0:v]scale=${W}:${p.fgH}[fg]`,
+    `[bg][fg]overlay=0:${p.off}[v]`,
+  ].join(';');
+  execFileSync(FF, ['-y', '-i', src, '-filter_complex', fc, '-map', '[v]', '-q:v', '2', out],
+    { stdio: 'ignore' });
+  return { ...p, out };
+}
+
+// ═══ РЕНДЕР ТЕКСТА ═══════════════════════════════════════════════════════════════════════════
+// Тот же служебный headless-хром, что у остальных сборщиков: своя вкладка, окно не трогаем.
+async function render(html, out) {
+  const { openAdmin } = require('./adminbrowser.cjs');
+  const { page, done } = await openAdmin();
+  try {
+    await page.setViewportSize({ width: W, height: H });
+    // ТАЙМАУТ 120 СЕКУНД (14.08). Именно ЭТОТ setContent падал ночью 32 раза из 293: хром один на
+    // всю ферму, и приведение кадров к 9:16 не укладывалось в 30 секунд по умолчанию. Разбор —
+    // в slidekit.cjs у такого же вызова.
+    await page.setContent(html, { waitUntil: 'load', timeout: 120000 });
+    await page.waitForTimeout(400);
+    const png = out.replace(/\.jpe?g$/i, '.png');
+    // Таймаут и на снимке: под общей очередью к хрому медленным становится весь путь до кадра,
+    // а не только setContent. Разбор — в slidekit.cjs у такого же вызова.
+    await page.screenshot({ path: png, timeout: 120000 });
+    execFileSync(FF, ['-y', '-i', png, '-q:v', '2', out], { stdio: 'ignore' });
+    fs.unlinkSync(png);
+  } finally { await done(); }
+  return out;
+}
+
+const b64of = (f) => ({ b64: fs.readFileSync(f).toString('base64'),
+  mime: /\.png$/i.test(f) ? 'image/png' : 'image/jpeg' });
+
+// ГОРИЗОНТАЛЬНЫЕ ОТСТУПЫ ТЕКСТА. Справа у тиктока колонка кнопок (140 px), слева край подписи
+// (120 px по измеренному шаблону). Текст у нас центрованный, поэтому берём симметрично по
+// худшему краю с небольшим запасом: 150 px. Иначе строка выглядит сдвинутой влево, а «найти» на
+// плашке уезжает под кнопку «поделиться».
+const PAD = 150;
+
+const shellCss = `*{margin:0;padding:0;box-sizing:border-box}
+  body{width:${W}px;height:${H}px;position:relative;overflow:hidden;background:#000;
+    font-family:-apple-system,'Helvetica Neue',Arial,sans-serif;-webkit-font-smoothing:antialiased}
+  img{width:${W}px;height:${H}px;object-fit:cover;display:block}`;
+
+// ХУК НА КАДРЕ 1. Правило владельца «текст всегда снизу» сохраняем.
+//
+// ЭТО ЕДИНСТВЕННОЕ МЕСТО, ГДЕ РИСУЕТСЯ ХУК РИЛСА. Здесь стояло `SAFE.bottom + 70 = 730 px от низа`,
+// то есть низ текста на 1190 из 1920 = 62% высоты. И это ровно то, на что владелец жаловался: на
+// 62% текст сидит высоко и на «низких» кадрах ложится на лицо.
+//
+// ЧЕМ ЭТО БЫЛО ОПАСНО ОСОБЕННО. 14.08 геометрию хука свели в slidekit и опустили до 82% — а на
+// рилсах не изменилось НИЧЕГО, потому что рилс приходит сюда, а не туда. Замер по готовому файлу
+// показал те же 62.0%, и правка выглядела сделанной, будучи несделанной. Копия в ДРУГОЙ системе
+// координат (9:16 против 4:5) — худший вид копии: её не находит ни греп по числу, ни греп по имени.
+//
+// ТЕПЕРЬ ЧИСЛО НЕ СВОЁ. Источник правды один — доля высоты готового рилса `slidekit.HOOK_LOW`
+// (0.82, выбор владельца по трём отрисованным вариантам). Здесь она просто переводится в пиксели
+// этого холста. Менять положение хука надо ТАМ, и тогда оно меняется и в карусели, и в рилсе.
+//
+// ПРЕЖНИЙ ДОВОД ПРО ЧИСТУЮ ЗОНУ НЕ ОТМЕНЁН, А ПЕРЕСМОТРЕН. SAFE.bottom = 660 px (34% снизу) —
+// оценка того, сколько закрывает интерфейс. Гейт рилсов (reelgate) бракует текст глубже 85%, и
+// именно по нему мы судим готовый файл. Между двумя оценками выбираем ту, которую проверяет гейт
+// и подтвердил глазами владелец.
+// ЧИТАЕМ ПРИ КАЖДОЙ ОТРИСОВКЕ, А НЕ ПРИ ЗАГРУЗКЕ МОДУЛЯ (14.08, третий подряд случай одной
+// ловушки). Node кэширует модуль на первом require, поэтому константа, вычисленная здесь один раз,
+// остаётся в памяти долгоживущего процесса НАВСЕГДА. Пачечная резка живёт часами, и правка
+// геометрии до неё просто не доходит: файл поправлен, а на плёнке старое число. Дважды подряд
+// замер «после фикса» показывал прежние 61.4% именно поэтому, и оба раза это выглядело как «фикс
+// не работает». Функция вместо константы стоит наносекунды и снимает вопрос: свежий прогон и
+// прогон трёхчасовой давности рисуют одинаково, а переменную окружения можно менять на лету.
+const низХука = () => Math.round(H * (1 - Number(process.env.HOOK_LOW || require('./slidekit.cjs').HOOK_LOW)));
+// Оставлено ради обратной совместимости: число экспортируется наружу и читается проверками.
+const HOOK_BOTTOM = низХука();
+
+async function hookSlideTT(src, out, text, opts = {}) {
+  const tmp = out.replace(/(\.\w+)$/, '_base$1');
+  const p = to916(src, tmp, { fill: opts.fill });
+  const { b64, mime } = b64of(tmp);
+  const lines = String(text || '').split('\n').map((l) => `<div>${l}</div>`).join('');
+  const html = `<!doctype html><meta charset="utf-8"><style>${shellCss}
+    .hookbar{position:absolute;left:0;right:0;bottom:${низХука()}px;padding:0 ${PAD}px;
+      text-align:center;color:#fff}
+    .hookbar div{font-size:52px;font-weight:800;line-height:1.24;letter-spacing:-.6px;
+      text-shadow:0 3px 14px rgba(0,0,0,.8), 0 1px 3px rgba(0,0,0,.95)}
+  </style><img src="data:${mime};base64,${b64}"><div class="hookbar">${lines}</div>`;
+  await render(html, out);
+  if (!opts.keepBase) fs.unlinkSync(tmp);
+  return { ...p, out, text: String(text || '') };
+}
+
+// ФИНАЛЬНАЯ ПЛАШКА. Слово-маркер НЕ пишем руками: его отдаёт контракт templates.frame4Marker.
+// Для тиктока это «шаблоны» (в инстаграм уезжает «промпты»), по слову в поиске мы и различаем
+// площадку. Плашка целиком внутри чистой зоны и не заезжает в правую колонку кнопок.
+const LENS = `<svg viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="#8a8a8f"
+  stroke-width="2.2" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.6"/><path d="M15.4 15.4 L21 21"/></svg>`;
+
+function darkTone(src) {
+  try {
+    const r = spawnSync(FF, ['-hide_banner', '-i', src, '-vf', 'crop=iw:ih*0.34:0:ih*0.5,scale=1:1',
+      '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'], { maxBuffer: 1 << 20 });
+    const b = r.stdout;
+    if (b && b.length >= 3) {
+      let [cr, cg, cb] = [b[0], b[1], b[2]];
+      const lum = 0.299 * cr + 0.587 * cg + 0.114 * cb;
+      const k = lum > 1 ? Math.min(1, 34 / lum) : 1;
+      return [Math.round(cr * k), Math.round(cg * k), Math.round(cb * k)];
+    }
+  } catch {}
+  return [10, 10, 12];
+}
+
+async function ctaSlideTT(src, out, opts = {}) {
+  const platform = opts.platform || 'tiktok';
+  const marker = require('./templates.cjs').frame4Marker(platform);
+  const tmp = out.replace(/(\.\w+)$/, '_base$1');
+  const p = to916(src, tmp, { fill: opts.fill });
+  const { b64, mime } = b64of(tmp);
+  const t = darkTone(opts.cover && fs.existsSync(opts.cover) ? opts.cover : src);
+  // ВЫСОТА ПЛАШКИ. У тиктока под кадром своя панель на 660 px, поэтому там плашка стоит высоко.
+  // Для рилсов начальник посмотрел готовый кадр 11.08 и сказал «чуть ниже»: в инстаграме нижний
+  // интерфейс тоньше, и плашка на тиктоковской высоте висит в середине кадра. Держим высоту
+  // отдельным доводом: рилсам 520 px от низа, тиктоку прежние 720.
+  const НИЗ = Number(opts.bottom || (platform === 'reels' ? 520 : SAFE.bottom + 60));
+  // ЗАТЕМНЕНИЕ ТЯНЕМ ДО САМОГО НИЗА КАНВАСА (правка 10.08 по осмотру глазами). Раньше оно
+  // обрывалось на границе чистой зоны, и поперёк фотографии шла ЗАМЕТНАЯ горизонтальная линия
+  // там, где градиент кончался, — ровно тот брак, которого мы боялись, только с другой стороны.
+  // Теперь тёмное непрерывно уходит вниз: у зрителя нет ни шва, ни полосы, а нижнюю часть всё
+  // равно закрывает интерфейс тиктока.
+  //
+  // ЛЕВЫЙ КРАЙ ПЛАШКИ по SAFE.left, а не PAD-80: прежние 70 px залезали в небезопасное поле.
+  const html = `<!doctype html><meta charset="utf-8"><style>${shellCss}
+    .fade{position:absolute;left:0;right:0;bottom:0;height:${SAFE.bottom + 520}px;
+      background:linear-gradient(to top,rgba(${t[0]},${t[1]},${t[2]},.86) 0%,
+        rgba(${t[0]},${t[1]},${t[2]},.72) 30%, rgba(${t[0]},${t[1]},${t[2]},.42) 62%,
+        rgba(${t[0]},${t[1]},${t[2]},0) 100%)}
+    .wrap{position:absolute;left:${SAFE.left}px;right:${PAD}px;bottom:${НИЗ}px;color:#fff}
+    .lead{font-size:31px;line-height:1.35;color:rgba(255,255,255,.94);font-weight:500;
+      text-shadow:0 2px 10px rgba(0,0,0,.55);margin-bottom:20px}
+    .bar{display:flex;align-items:center;gap:18px;background:rgba(255,255,255,.96);
+      border-radius:999px;padding:20px 26px 20px 28px;box-shadow:0 16px 40px rgba(0,0,0,.34)}
+    .bar .q{flex:1;font-size:37px;font-weight:600;color:#16181d;letter-spacing:-.3px;white-space:nowrap}
+    .bar .go{font-size:25px;color:#9a9aa0;font-weight:500;border-left:2px solid rgba(0,0,0,.1);padding-left:18px}
+    .foot{margin-top:18px;font-size:25px;color:rgba(255,255,255,.86);text-shadow:0 2px 9px rgba(0,0,0,.6)}
+    .foot b{font-weight:600;color:#fff}
+  </style><img src="data:${mime};base64,${b64}">
+  <div class="fade"></div><div class="wrap">
+    <div class="lead">делала себе тут, просто наберите в яндексе:</div>
+    <div class="bar"><span>${LENS}</span><span class="q">нейронка про ${marker}</span><span class="go">найти</span></div>
+    <div class="foot"><b>neironka.pro</b> · первые генерации бесплатно</div></div>`;
+  await render(html, out);
+  if (!opts.keepBase) fs.unlinkSync(tmp);
+  return { ...p, out, platform, marker };
+}
+
+// ═══ ПОСТ ЦЕЛИКОМ ════════════════════════════════════════════════════════════════════════════
+// На входе четыре ГОТОВЫХ кадра поста (наши обычные 4:5) или четыре исходника. На выходе четыре
+// кадра 9:16 под фотокарусель тиктока.
+//
+// ВАЖНО ПРО ВХОД. Кадр 1 и кадр 4 приходят уже с НАШИМ текстом, впечатанным по инстаграмной
+// вёрстке (хук на 84-90% высоты, плашка на 69-79%). Такой текст в тиктоке уезжает под подпись, и
+// перерисовать его на месте нельзя. Поэтому по умолчанию текст на кадры 1 и 4 наносим ЗАНОВО, а
+// на вход ждём ЧИСТЫЕ кадры без надписей (opts.clean = true). Если чистых нет, режим
+// opts.asis = true просто переводит готовые кадры в 9:16 без нового текста: пост станет
+// форматно правильным, но старый текст останется низко.
+// КАКИЕ КАДРЫ СЧИТАЕМ КАРТОЧКАМИ. По нашему стандарту поста карточка от фабрики это ВТОРОЙ кадр
+// (индекс 1) во всех четырёх рабочих шаблонах. Список можно переопределить: opts.cards = [1, 2].
+// Явный список, а не угадывание по картинке: ошибка автодетекта тут стоит нечитаемого кадра.
+async function buildPostTT(frames, outDir, opts = {}) {
+  fs.mkdirSync(outDir, { recursive: true });
+  const cards = new Set(opts.cards || [1]);
+  const res = [];
+  for (let i = 0; i < frames.length; i++) {
+    const out = path.join(outDir, `tt${i}.jpg`);
+    if (!opts.asis && i === 0 && opts.hook) {
+      res.push(await hookSlideTT(frames[i], out, opts.hook));
+    } else if (!opts.asis && i === frames.length - 1 && opts.cta !== false) {
+      res.push(await ctaSlideTT(frames[i], out, { platform: 'tiktok', cover: frames[0] }));
+    } else if (cards.has(i)) {
+      res.push(cardTo916(frames[i], out, { bg: frames[0] }));
+    } else {
+      res.push({ ...to916(frames[i], out), out });
+    }
+  }
+  return res;
+}
+
+// ═══ ЧТО ТЕРЯЕТСЯ ПРИ РАЗНЫХ СПОСОБАХ ПРИВЕДЕНИЯ ═════════════════════════════════════════════
+// Чистая геометрия, нужна для отчётов: сколько процентов кадра съедает каждый вариант.
+function lossReport(srcW = 1080, srcH = 1350) {
+  const srcR = srcW / srcH, dstR = W / H;
+  // Вариант «залить экран» (cover): срезается то, чего в избытке.
+  const cover = srcR > dstR
+    ? { axis: 'ширина', lost: 1 - dstR / srcR }
+    : { axis: 'высота', lost: 1 - srcR / dstR };
+  // Вариант «вписать целиком» (contain): пустая доля экрана.
+  const contain = srcR > dstR
+    ? { axis: 'высота экрана', empty: 1 - dstR / srcR }
+    : { axis: 'ширина экрана', empty: 1 - srcR / dstR };
+  return {
+    src: `${srcW}x${srcH}`, srcRatio: +srcR.toFixed(4), dstRatio: +dstR.toFixed(4),
+    heightWeGive: +((srcH / srcW) / (H / W)).toFixed(4),   // 0.7031 для 4:5
+    cover: { axis: cover.axis, lostPct: +(cover.lost * 100).toFixed(1),
+      perSidePct: +((cover.lost / 2) * 100).toFixed(1) },
+    contain: { axis: contain.axis, emptyPct: +(contain.empty * 100).toFixed(1),
+      perSidePct: +((contain.empty / 2) * 100).toFixed(1) },
+    cleanBand: { topPct: +((CLEAN_TOP / H) * 100).toFixed(1),
+      bottomPct: +((SAFE.bottom / H) * 100).toFixed(1),
+      cleanPct: +((CLEAN_H / H) * 100).toFixed(1) },
+  };
+}
+
+module.exports = { W, H, SAFE, CLEAN_TOP, CLEAN_BOTTOM, CLEAN_H, PAD, HOOK_BOTTOM, CARD_W,
+  to916, plan916, cardTo916, hookSlideTT, ctaSlideTT, buildPostTT, faceBox, probeSize, lossReport,
+  renderHtml: render };
+
+if (require.main === module) {
+  (async () => {
+    const arg = (k, d) => { const i = process.argv.indexOf('--' + k); return i > 0 ? process.argv[i + 1] : d; };
+    const dir = arg('frames');
+    if (!dir) { console.log(JSON.stringify(lossReport(), null, 2)); return; }
+    const files = fs.readdirSync(dir).filter((f) => /^f\d\.jpe?g$/i.test(f)).sort()
+      .map((f) => path.join(dir, f));
+    const out = arg('out', path.join('/tmp', 'tt_' + path.basename(dir)));
+    const r = await buildPostTT(files, out, { hook: arg('hook'), asis: process.argv.includes('--asis') });
+    console.log(JSON.stringify(r, null, 2));
+  })().catch((e) => { console.error(e); process.exit(1); });
+}

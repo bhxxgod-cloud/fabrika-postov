@@ -1,0 +1,6 @@
+audio/
+node_modules/
+.git/
+*.png
+*.jpg
+*.mp4

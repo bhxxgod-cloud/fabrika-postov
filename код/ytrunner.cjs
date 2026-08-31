@@ -1,0 +1,602 @@
+#!/usr/bin/env node
+/**
+ * ytrunner.cjs — МОСТ ПАНЕЛЬ→МАК для ютуб-канала (17.08).
+ * Панель (src/youtube.ts) держит настройки текста, OAuth-токен канала и очередь yt_queue в БД.
+ * Этот раннер на маке: (1) сканит папки с готовыми mp4 и кладёт их в очередь, (2) грузит файлы
+ * с диска на канал через YouTube Data API с соблюдением темпа (per_day / gap_min из yt_settings).
+ * Описание, хэштеги и ссылка с UTM собираются ТАК ЖЕ, как на сервере (buildMeta ниже = buildYtMeta).
+ *
+ *   node ytrunner.cjs scan <папка> [--ch <id|slug>] [--limit N] [--shuffle] [--at "2026-08-18 10:00"] [--texts <папка с .ig.txt/.tt.txt>]
+ *   node ytrunner.cjs add <mp4>... [--ch <id|slug>]      положить конкретные файлы (в этом порядке)
+ *   node ytrunner.cjs loop  [--poll 60]      крутиться: брать queued с file_path и грузить в окно темпа
+ *   node ytrunner.cjs once  [--ch <id|slug>] [--dry] [--force]  один ролик сейчас (--dry: текст без загрузки; --force: мимо слотов)
+ *   node ytrunner.cjs status
+ *
+ * ОБЛОЖКА (17.08): API не умеет ставить кастомную обложку Shorts, ютуб берёт кадр из ролика. Поэтому раннер
+ * ищет обложку (<имя>.кадр1.jpg рядом с mp4 / в --texts / в папке _кадры, иначе первый кадр) и ВКЛЕИВАЕТ её
+ * первым кадром на 0.6 сек (ffmpeg-static), плюс шлёт thumbnails.set (для обычных видео работает, для Shorts
+ * не мешает). Отключить: --no-bake.
+ *
+ * БД: DB_PUBLIC_URL или /tmp/dburl.txt (как у localrunner.cjs).
+ */
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { Client } = require('pg');
+const { spawnSync } = require('child_process');
+let FFMPEG = null; try { FFMPEG = require('ffmpeg-static'); } catch {}
+
+const DBURL = process.env.DB_PUBLIC_URL || (() => { for (const f of [require('os').homedir() + '/.neironka_dburl', '/tmp/dburl.txt']) { try { return fs.readFileSync(f, 'utf8').trim(); } catch {} } throw new Error('нет DB_PUBLIC_URL / ~/.neironka_dburl'); })();
+const args = process.argv.slice(2);
+const cmd = args[0];
+const flag = (n, d) => { const i = args.indexOf(n); if (i === -1) return d; const v = args[i + 1]; return v === undefined || v.startsWith('--') ? true : v; };
+const has = (n) => args.includes(n);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const log = (...a) => console.log(`[${new Date().toISOString().slice(11, 19)}]`, ...a);
+const RUNNER = 'ytrunner' + (process.env.RUNNER_ID ? '#' + process.env.RUNNER_ID : '');
+
+let db;
+async function chan(idOrSlug) {
+  const v = idOrSlug ?? flag('--ch', 1);
+  const r = /^\d+$/.test(String(v)) ? await q(`SELECT * FROM yt_channels WHERE id=$1`, [+v]) : await q(`SELECT * FROM yt_channels WHERE slug=$1`, [String(v)]);
+  if (!r.rows[0]) throw new Error('нет канала ' + v);
+  return r.rows[0];
+}
+async function connect() {
+  db = new Client({ connectionString: DBURL, ssl: /rlwy|railway|sslmode=require/.test(DBURL) ? { rejectUnauthorized: false } : undefined, connectionTimeoutMillis: 15000 });
+  // Без обработчика 'error' обрыв сети (EADDRNOTAVAIL 21.08 ~12:10) роняет ВЕСЬ процесс:
+  // pg кидает событие error вне query, unhandled event = краш. Логируем и помечаем клиента дохлым,
+  // следующий q() переподключится.
+  db.on('error', (e) => { console.log('[pg] соединение упало: ' + e.message); db._умер = true; });
+  await db.connect();
+}
+const q = async (sql, p) => {
+  if (db && db._умер) { try { await db.end(); } catch {} await connect(); }
+  return db.query(sql, p);
+};
+
+// ---- файлы ----
+const safeList = (d) => { try { return fs.readdirSync(d); } catch { return []; } };
+function fileHash(p) {
+  const h = crypto.createHash('sha1'); const st = fs.statSync(p); const fd = fs.openSync(p, 'r'); const buf = Buffer.alloc(1 << 20);
+  let n = fs.readSync(fd, buf, 0, buf.length, 0); h.update(buf.subarray(0, n));
+  if (st.size > buf.length) { n = fs.readSync(fd, buf, 0, buf.length, st.size - buf.length); h.update(buf.subarray(0, n)); }
+  fs.closeSync(fd); h.update(String(st.size)); return h.digest('hex').slice(0, 16);
+}
+// Подпись рядом с роликом: <имя>.ig.txt / .tt.txt / .txt в той же папке, соседних или подпапках
+// (в СОКРОВИЩНИЦЕ тексты лежат в «ТОП РОЛИКИ + ТЕКСТ/<модель>/…»). Номер-префикс 001_ отбрасываем.
+let _textIndex = null; // имя без расширения -> путь к .txt (из --texts, рекурсивно)
+function textIndex() {
+  if (_textIndex) return _textIndex;
+  _textIndex = new Map();
+  const root = flag('--texts', process.env.YT_TEXTS || '');
+  if (root && root !== true && fs.existsSync(root)) (function walk(d) { for (const n of safeList(d)) { const p = path.join(d, n); let st; try { st = fs.statSync(p); } catch { continue; }
+    if (st.isDirectory()) walk(p); else if (/\.txt$/.test(n)) { const k = n.replace(/\.(ig|tt)?\.?txt$/, '').replace(/\.(ig|tt)$/, ''); if (!_textIndex.has(k) || /\.ig\.txt$/.test(n)) _textIndex.set(k, p); } } })(root);
+  return _textIndex;
+}
+function findSidecar(mp4) {
+  const dir = path.dirname(mp4); const base = path.basename(mp4, '.mp4');
+  const bases = [base, base.replace(/^\d{3}_/, '')];
+  for (const b of bases) if (textIndex().has(b)) return textIndex().get(b);
+  const dirs = [dir, path.join(dir, '..')];
+  for (const d of [dir, path.join(dir, '..')]) for (const n of safeList(d)) { const p = path.join(d, n); try { if (fs.statSync(p).isDirectory()) { dirs.push(p); for (const m of safeList(p)) { const pp = path.join(p, m); if (fs.statSync(pp).isDirectory()) dirs.push(pp); } } } catch {} }
+  for (const d of dirs) for (const b of bases) for (const ext of ['.ig.txt', '.tt.txt', '.txt']) { const p = path.join(d, b + ext); if (fs.existsSync(p)) return p; }
+  return null;
+}
+
+// Обложка: <имя>.кадр1.jpg / .cover.jpg / .jpg рядом, в индексе --texts, в _кадры; иначе null (возьмём первый кадр).
+let _coverIndex = null;
+function coverIndex() {
+  if (_coverIndex) return _coverIndex; _coverIndex = new Map();
+  const root = flag('--texts', process.env.YT_TEXTS || '');
+  if (root && root !== true && fs.existsSync(root)) (function walk(d) { for (const n of safeList(d)) { const p = path.join(d, n); let st; try { st = fs.statSync(p); } catch { continue; }
+    if (st.isDirectory()) walk(p); else if (/\.кадр1\.(jpg|png)$/i.test(n)) _coverIndex.set(n.replace(/\.кадр1\.(jpg|png)$/i, ''), p); } })(root);
+  return _coverIndex;
+}
+function findCover(mp4) {
+  const dir = path.dirname(mp4); const base = path.basename(mp4, '.mp4'); const bases = [base, base.replace(/^\d{3}_/, '')];
+  for (const b of bases) for (const d of [dir, path.join(dir, '_кадры'), path.join(dir, '..', '_кадры')]) for (const suf of ['.кадр1.jpg', '.кадр1.png', '.cover.jpg', '.jpg', '.png']) { const p = path.join(d, b + suf); if (fs.existsSync(p)) return p; }
+  for (const b of bases) if (coverIndex().has(b)) return coverIndex().get(b);
+  return null;
+}
+// Вклеиваем обложку первым кадром (0.6 с), звук сдвигаем. Возвращает путь к временному mp4 или исходник при сбое.
+function bakeCover(mp4, cover, outDir) {
+  if (!FFMPEG || !cover) return mp4;
+  fs.mkdirSync(outDir, { recursive: true });
+  const out = path.join(outDir, path.basename(mp4, '.mp4') + '.cover.mp4');
+  if (fs.existsSync(out) && fs.statSync(out).mtimeMs > fs.statSync(mp4).mtimeMs) return out;
+  const r = spawnSync(FFMPEG, ['-y', '-loop', '1', '-t', '0.6', '-i', cover, '-i', mp4,
+    '-filter_complex', '[0:v][1:v]scale2ref[c][v1];[c]setsar=1,fps=30,format=yuv420p[c2];[v1]fps=30,format=yuv420p[v2];[c2][v2]concat=n=2:v=1:a=0[v];[1:a]adelay=600|600[a]',
+    '-map', '[v]', '-map', '[a]', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out], { stdio: 'pipe', timeout: 180000 });
+  if (r.status !== 0) { log('   ffmpeg не смог вклеить обложку: ' + String(r.stderr).slice(-200)); return mp4; }
+  return out;
+}
+// Обложки делает ЕДИНЫЙ генератор thumbgen.cjs (спека согласована 21.08: живое лицо,
+// плашка с просветом 10%, Verdana Bold, эмодзи-пул). Правки формата — только там.
+const { makeThumb } = require('./thumbgen.cjs');
+const { allowedForChannel, styleOf, личныйФайл } = require('./tpl_rules.cjs');
+// Страны показа: оставляем только те, где работает оплата картой РФ.
+const REGIONS = (process.env.YT_REGIONS || 'RU,BY').split(',').map((x) => x.trim()).filter(Boolean);
+// ЗАКРЕПЛЯЕМЫЙ КОММЕНТАРИЙ ПОД СВЕЖИЙ РОЛИК (26.08, приказ владельца «надо закреплять свой
+// комментарий на каждом видео»). Пишем сразу после публикации, от лица канала.
+//
+// ЗАКРЕПИТЬ ОТСЮДА НЕЛЬЗЯ: в YouTube Data API v3 нет ни одного метода pin, проверено по
+// дискавери-схеме (есть только insert/list/update/delete/setModerationStatus). Закрепление
+// живёт исключительно в веб-интерфейсе, поэтому раннер комментарий ПИШЕТ, а закрепляют руками
+// или отдельным браузерным проходом.
+//
+// Ссылку в текст не кладём: ютуб режет ссылки в комментариях как спам, а в описании она уже есть.
+const КОММ_ПУЛ = (() => { try { return require('./комментарии-пул.json'); } catch { return {}; } })();
+async function firstComment(s, videoId, filePath) {
+  const { templateOf } = (() => { try { return require('./tpl_rules.cjs'); } catch { return {}; } })();
+  const tpl = (() => {
+    const b = String(filePath || '').toLowerCase();
+    for (const k of Object.keys(КОММ_ПУЛ)) if (!k.startsWith('_') && b.includes(k)) return k;
+    return '_общие';
+  })();
+  const пул = КОММ_ПУЛ[tpl] || КОММ_ПУЛ._общие || [];
+  if (!пул.length) return;
+  // Выбор по хешу «канал + ролик»: один и тот же ролик всегда получает один и тот же текст,
+  // а два канала с роликом одной темы в один день получают РАЗНЫЕ (на хеше только от videoId
+  // два канала уже словили одинаковый комментарий).
+  let h = 0; for (const ch of String(s.slug) + '|' + String(videoId)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  const текст = пул[h % пул.length];
+  const token = await accessToken(s);
+  const r = await fetch('https://www.googleapis.com/youtube/v3/commentThreads?part=snippet', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ snippet: { videoId, topLevelComment: { snippet: { textOriginal: текст } } } }),
+  });
+  if (r.ok) log('   комментарий написан (закрепить надо руками, API не умеет)');
+  else log('   комментарий не встал: ' + r.status + ' ' + (await r.text()).slice(0, 120));
+}
+
+async function setRegion(c, videoId, queueId) {
+  try {
+    const r = await fetch('https://www.googleapis.com/youtube/v3/videos?part=contentDetails', {
+      method: 'PUT',
+      headers: { authorization: 'Bearer ' + await accessToken(c), 'content-type': 'application/json' },
+      body: JSON.stringify({ id: videoId, contentDetails: { regionRestriction: { allowed: REGIONS } } }),
+    });
+    if (r.ok) { log('   показ ограничен странами: ' + REGIONS.join(', ')); return true; }
+    log('   регион не выставился: ' + r.status + ' ' + (await r.text()).slice(0, 100));
+  } catch (e) { log('   регион, сбой: ' + e.message); }
+  return false;
+}
+
+// Итог установки пишем в yt_queue (thumb_set_at / thumb_err), иначе потом не проверить,
+// у каких роликов обложка реально встала, а у каких ютуб её отбил.
+async function setThumbnail(c, videoId, cover, queueId) {
+  try {
+    const r = await fetch('https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=' + videoId, { method: 'POST',
+      headers: { authorization: 'Bearer ' + await accessToken(c), 'content-type': /png$/i.test(cover) ? 'image/png' : 'image/jpeg' }, body: fs.readFileSync(cover) });
+    if (r.ok) { if (queueId) await q(`UPDATE yt_queue SET thumb_set_at=now(), thumb_err=NULL WHERE id=$1`, [queueId]).catch(() => {}); return true; }
+    const msg = r.status + ' ' + (await r.text()).slice(0, 140);
+    log('   thumbnails.set: ' + msg);
+    if (queueId) await q(`UPDATE yt_queue SET thumb_err=$2 WHERE id=$1`, [queueId, msg]).catch(() => {});
+  } catch (e) {
+    log('   thumbnails.set сбой: ' + e.message);
+    if (queueId) await q(`UPDATE yt_queue SET thumb_err=$2 WHERE id=$1`, [queueId, 'сбой: ' + e.message.slice(0, 120)]).catch(() => {});
+  }
+  return false;
+}
+
+// ---- текст (зеркало buildYtMeta из src/youtube.ts) ----
+function buildMeta(s, item) {
+  const utmContent = item.utm_content || ('yt' + item.id + '_' + String(item.file_hash || '').slice(0, 8));
+  const isShort = /\/go\//.test(s.landing); // трекинг-ссылка админки сама проставит utm
+  const link = isShort ? s.landing
+    : s.landing + (s.landing.includes('?') ? '&' : '?') + new URLSearchParams({ utm_source: s.utm_source, utm_medium: s.utm_medium, utm_campaign: s.utm_campaign, utm_content: utmContent }).toString();
+  let title = '', hookLine = '';
+  if (item.src_text) { const lines = item.src_text.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#')); hookLine = lines[0] || ''; title = hookLine.split(/[.!?]/)[0].trim(); }
+  if (item.ai_title) title = item.ai_title.trim();
+  if (!title && item.src_title) title = item.src_title;
+  if (!title) { const pool = s.titles.split('\n').map((t) => t.trim()).filter(Boolean); const idx = parseInt((item.file_hash || '0').slice(0, 6), 16) % Math.max(1, pool.length); title = pool[idx] || 'Нейросеть по одному селфи'; }
+  title = title.replace(/[<>]/g, '').replace(/^\p{Ll}/u, (c) => c.toUpperCase());
+  if (title.length > 90) title = title.slice(0, 87).trim() + '…';
+  const isYT = !s.platform || s.platform === 'youtube';
+  if (isYT && !/#shorts/i.test(title)) title += ' #Shorts';
+  const BAD_TAGS = /ринопласт|пластическ|хирург|операц|филлер|ботокс|мужск|парн[яю]м/i;
+  const tags = new Set(s.hashtags.split(/\s+/).filter((t) => t.startsWith('#')));
+  if (item.src_text) for (const t of item.src_text.match(/#[\p{L}\p{N}_]+/gu) || []) if (!BAD_TAGS.test(t)) tags.add(t);
+  if (isYT && ![...tags].some((t) => t.toLowerCase() === '#shorts')) tags.add('#shorts');
+  if (!isYT) for (const t of [...tags]) if (t.toLowerCase() === '#shorts') tags.delete(t);
+  let parts;
+  if (s.platform === 'vk') {
+    // ВК-клипы не показывают name — заголовок идёт ПЕРВОЙ строкой описания, дальше воздух.
+    // В конце обязательная строка про Алису (приказ 21.08).
+    parts = [title, `${s.cta}${link}`];
+    if (s.body) parts.push(s.body);
+    parts.push([...tags].slice(0, 15).join(' '));
+    parts.push('Нейронка про ❤️ любит Алису от Яндекса!');
+  } else {
+    parts = [`${s.cta}${link}`];
+    if (hookLine && hookLine !== title) parts.push(hookLine.replace(/нейронка про шаблоны/gi, 'нейронка про промпты'));
+    if (s.body) parts.push(s.body);
+    parts.push([...tags].slice(0, 15).join(' '));
+  }
+  return { title, description: parts.join('\n\n').replace(/[<>]/g, '').slice(0, 4900), utm_content: utmContent };
+}
+
+// Проверка текста (зеркало ytMetaProblems): без UTM/хэштегов/нормального названия ролик не уходит.
+function metaProblems(m) {
+  const bad = []; const t = m.title.replace(/#shorts/i, '').trim();
+  if (t.length < 8) bad.push('название короче 8 знаков'); if (t.length > 95) bad.push('название длиннее 95');
+  if (/[<>]|—/.test(m.title + m.description)) bad.push('запрещённые символы (< > —)');
+  if (!/neironka\.pro/.test(m.description)) bad.push('нет ссылки на сайт');
+  if ((m.description.match(/#[\p{L}\p{N}_]+/gu) || []).length < 3) bad.push('меньше 3 хэштегов');
+  if (/#Shorts/i.test(m.title) && !/#shorts/i.test(m.description)) bad.push('нет #shorts');
+  return bad.length ? bad.join('; ') : null;
+}
+async function notifyTg(text) {
+  const { rows } = await q(`SELECT 1`).catch(() => ({ rows: [] })); if (!rows.length) return;
+  const safeRead = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return ''; } };
+  const tok = process.env.TELEGRAM_BOT_TOKEN || safeRead('/tmp/.tgtok'), chat = process.env.TELEGRAM_CHAT_ID || safeRead('/tmp/.tgchat'); if (!tok || !chat) return;
+  await fetch(`https://api.telegram.org/bot${tok}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: chat, text, disable_web_page_preview: true }) }).catch(() => {});
+}
+// Сторож ВК-токена (21.08): юзер-токен живёт ~24ч, протухает молча и канал стоит с
+// «User authorization failed». Шлём в ТГ готовую oauth-ссылку, не чаще раза в 3 часа.
+let _vkAlertAt = 0;
+// Токен ВК живёт сутки. Сначала пробуем обновить его сами (vktoken.cjs держит свой профиль
+// браузера, где ВК залогинен), и только если не вышло — зовём владельца в телеграм.
+async function vkTokenAlert(err) {
+  if (!/User authorization failed|access_token has expired|invalid access_token/i.test(String(err))) return;
+  if (Date.now() - _vkAlertAt < 3 * 3600e3) return;
+  _vkAlertAt = Date.now();
+  try {
+    const out = spawnSync('node', [path.join(__dirname, 'vktoken.cjs')], { encoding: 'utf8', timeout: 120000 });
+    if (out.status === 0) {
+      log('   ВК-токен обновлён сам: ' + String(out.stdout).trim().split('\n').pop());
+      await notifyTg('✅ ВК-токен протух и обновлён автоматически, клипы поехали дальше.');
+      _vkAlertAt = 0;   // снимаем паузу: следующий тик уже сможет постить
+      return;
+    }
+    log('   авто-обновление ВК-токена не вышло: ' + String(out.stdout || out.stderr).trim().slice(-160));
+  } catch (e) { log('   vktoken.cjs не запустился: ' + e.message); }
+  await notifyTg('⚠️ ВК-токен протух, а обновить сам не смог (нужен разовый вход в профиль).\nНа маке: cd ~/Desktop/neironka-poster && node vktoken.cjs --login\nЛибо по-старому: открой ссылку, разреши, пришли access_token сюда:\nhttps://oauth.vk.com/authorize?client_id=54728511&display=page&redirect_uri=https://oauth.vk.com/blank.html&scope=video,wall,groups&response_type=token&v=5.199');
+}
+
+// ---- Google ----
+const _access = new Map();
+async function accessToken(c) {
+  const a = _access.get(c.id); if (a && a.exp > Date.now() + 60e3) return a.token;
+  if (!c.refresh_token) throw new Error(`канал ${c.slug} не подключён (панель → YouTube → Подключить канал)`);
+  if (!c.client_id || !c.client_secret) throw new Error(`у канала ${c.slug} нет client_id/secret`);
+  const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ refresh_token: c.refresh_token, client_id: c.client_id, client_secret: c.client_secret, grant_type: 'refresh_token' }) }).then((r) => r.json());
+  if (!r.access_token) throw new Error('refresh failed: ' + (r.error_description || r.error || JSON.stringify(r)));
+  const t = { token: r.access_token, exp: Date.now() + (r.expires_in || 3600) * 1e3 }; _access.set(c.id, t); return t.token;
+}
+
+async function upload(item, s, dry) {
+  const meta = buildMeta(s, item);
+  const bad = metaProblems(meta); if (bad) throw new Error('текст не прошёл проверку: ' + bad);
+  const cover = item.cover_path && fs.existsSync(item.cover_path) ? item.cover_path : findCover(item.file_path);
+  const src = (has('--no-bake') || dry) ? item.file_path : bakeCover(item.file_path, cover, path.join(os.tmpdir(), 'ytrunner-baked'));
+  const size = fs.statSync(src).size;
+  log(`→ #${item.id} ${path.basename(item.file_path)} (${(size / 1e6).toFixed(1)}MB) обложка: ${cover ? path.basename(cover) + (src !== item.file_path ? ' (вклеена)' : '') : 'нет, первый кадр'}`);
+  log(`   ${meta.title}`);
+  if (dry) { console.log(meta.description.split('\n').map((l) => '     ' + l).join('\n')); return { id: 'dry', meta }; }
+  const init = await fetch('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status', {
+    method: 'POST',
+    headers: { authorization: 'Bearer ' + await accessToken(s), 'content-type': 'application/json; charset=UTF-8', 'x-upload-content-type': 'video/mp4', 'x-upload-content-length': String(size) },
+    body: JSON.stringify({
+      snippet: { title: meta.title, description: meta.description, categoryId: '22', defaultLanguage: 'ru', defaultAudioLanguage: 'ru' },
+      status: { privacyStatus: s.privacy || 'public', selfDeclaredMadeForKids: false, embeddable: true },
+    }),
+  });
+  if (!init.ok) { const j = await init.json().catch(() => ({})); const e = new Error(`init ${init.status}: ${j.error?.message || ''}`); e.reason = j.error?.errors?.[0]?.reason; throw e; }
+  const loc = init.headers.get('location');
+  const buf = fs.readFileSync(src);
+  for (let attempt = 1; ; attempt++) {
+    const put = await fetch(loc, { method: 'PUT', headers: { 'content-length': String(size), 'content-type': 'video/mp4' }, body: buf }).catch((e) => ({ ok: false, status: 0, text: async () => String(e) }));
+    if (put.ok) {
+      const j = await put.json();
+      // Обложку ставим ТОЛЬКО с плашкой-заголовком. Если генератор сорвался, голый кадр не шлём:
+      // пустая обложка хуже отсутствующей, её потом не отличить от нормальной и не перезалить.
+      // Показ только в РФ и Беларуси (владелец 25.08: аудитория из Средней Азии не платит картой РФ).
+      // Это жёсткая блокировка, а не таргетинг: в остальных странах ролик просто не откроется.
+      await setRegion(s, j.id, item.id).catch(() => {});
+      await firstComment(s, j.id, item.file_path).catch(() => {});
+      const thumb = makeThumb(item.file_path, meta.title, path.join(os.tmpdir(), 'ytrunner-baked'), { slug: s.slug });
+      if (thumb) await setThumbnail(s, j.id, thumb, item.id);
+      else {
+        log('   обложка не собралась, оставляю без неё (дольёт ytthumbs)');
+        await q(`UPDATE yt_queue SET thumb_err=$2 WHERE id=$1`, [item.id, 'генератор обложки сорвался при заливке']).catch(() => {});
+      }
+      return { id: j.id, meta, cover };
+    }
+    if (attempt > 4 || (put.status && put.status < 500 && put.status !== 308)) throw new Error(`upload ${put.status}: ${(await put.text()).slice(0, 300)}`);
+    log(`   ретрай #${attempt} (status ${put.status})`); await sleep(3000 * attempt);
+  }
+}
+
+// ---- ВК: заливка вертикалки как видео сообщества (официального API клипов нет).
+// Нужен USER-токен со scope video,groups,wall,offline и group_id в auth канала.
+async function uploadVK(item, s, meta) {
+  const a = s.auth || {};
+  if (!a.access_token || !a.group_id) throw new Error('vk: нет access_token/group_id в auth канала');
+  const api = (m, params) => fetch(`https://api.vk.com/method/${m}?` + new URLSearchParams({ ...params, access_token: a.access_token, v: '5.199' }))
+    .then((r) => r.json()).then((j) => { if (j.error) throw new Error(`vk ${m}: ${j.error.error_msg}`); return j.response; });
+  const save = await api('video.save', { name: meta.title.replace(/#Shorts/i, '').trim(), description: meta.description,
+    group_id: String(a.group_id).replace(/^-/, ''), wallpost: a.wallpost === false ? 0 : 1 });
+  const form = new FormData();
+  form.append('video_file', new Blob([fs.readFileSync(item._src || item.file_path)], { type: 'video/mp4' }), 'clip.mp4');
+  const up = await fetch(save.upload_url, { method: 'POST', body: form }).then((r) => r.json());
+  if (!up.video_id && !save.video_id) throw new Error('vk upload: ' + JSON.stringify(up).slice(0, 200));
+  const vid = up.video_id || save.video_id;
+  return { id: `${save.owner_id}_${vid}`, url: `https://vk.com/video${save.owner_id}_${vid}`, meta };
+}
+
+// ---- Рутуб: токен в auth.token (Token <...>), затем /api/video/ + загрузка файла.
+async function uploadRutube(item, s, meta) {
+  const a = s.auth || {};
+  if (!a.token) throw new Error('rutube: нет token в auth канала');
+  const H = { Authorization: 'Token ' + a.token };
+  const form = new FormData();
+  form.append('title', meta.title.replace(/#Shorts/i, '').trim());
+  form.append('description', meta.description);
+  form.append('is_hidden', 'false');
+  form.append('category', String(a.category || 13)); // 13 = «Хобби», безопасный дефолт
+  const created = await fetch('https://rutube.ru/api/video/', { method: 'POST', headers: H, body: form }).then(async (r) => {
+    const t = await r.text(); if (!r.ok) throw new Error('rutube create ' + r.status + ': ' + t.slice(0, 200)); return JSON.parse(t); });
+  const vid = created.video_id || created.id;
+  const f2 = new FormData();
+  f2.append('file', new Blob([fs.readFileSync(item._src || item.file_path)], { type: 'video/mp4' }), 'clip.mp4');
+  const up = await fetch(`https://rutube.ru/api/video/${vid}/upload/`, { method: 'POST', headers: H, body: f2 });
+  if (!up.ok) throw new Error('rutube upload ' + up.status + ': ' + (await up.text()).slice(0, 200));
+  return { id: String(vid), url: `https://rutube.ru/video/${vid}/`, meta };
+}
+
+// ---- гейт темпа (зеркало ytCanPostNow/ytSlotOpen на сервере): слоты по МСК, один ролик на слот ----
+// ДРОЖЬ ВНУТРИ СЛОТА (26.08). Слот открыт целый час, но раннер брал ролик первым же тиком, то есть
+// публикация выходила в НУЛЕВУЮ минуту часа. Ровные времена заметны сами по себе: живой человек не
+// выкладывает ролик ровно в 15:00:0x каждый раз. Ветка фермы телефонов поймала у себя то же самое
+// (первый пост суток выходил в 06:30:00 секунда в секунду четыре дня подряд) и предупредила.
+// Сдвиг детерминированный, от имени канала: одинаковый в каждом слоте у одного канала, разный
+// между каналами, и не даёт двум каналам совпасть, если их часы всё же пересеклись.
+function сдвигМинут(slug) {
+  // Первая версия брала 7 + hash%39 и на наших пяти каналах легла лесенкой в первой половине часа
+  // (10, 16, 20, 27, 31): равномерного шага в пять-семь минут не бывает у живых людей, и такое
+  // распределение заметно само по себе, даже если каждая отдельная минута выглядит случайной.
+  // Ветка фермы телефонов поймала у себя тот же класс ошибки: увела публикации от ровного часа
+  // и приземлила их в одну точку «час плюс три минуты», четырнадцать процентов вместо полутора.
+  // Поэтому берём ВЕСЬ час и второй, независимый множитель хеша, чтобы соседние имена не давали
+  // соседние минуты.
+  let h = 2166136261;
+  for (const ch of String(slug || '')) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; }
+  return 4 + (h % 52);   // 4..55 минут: весь час, кроме первых минут и самого конца
+}
+function slotOpen(postHours, lastPostedAt, now = new Date(), slug = '', минута = null) {
+  const hours = String(postHours || '').split(/[,\s]+/).filter(Boolean).map(Number).filter((h) => Number.isFinite(h) && h >= 0 && h < 24);
+  if (!hours.length) return null;
+  const msk = new Date(now.getTime() + 3 * 3600e3); const h = msk.getUTCHours();
+  const slot = hours.find((sh) => h >= sh && h < sh + 1);
+  if (slot === undefined) return `ждём слот (${hours.map((x) => x + ':00').join(', ')} МСК)`;
+  // Минута берётся из поля канала, если оно задано, и только иначе из хеша. Хеш годился, пока
+  // каналов было пять; на десяти он выдал почти одинаковые минуты (05, 05, 08, 12, 13, 38, 39,
+  // 46, 49) и развести публикации стало невозможно в принципе: свободы в часах для этого мало.
+  // Поле позволяет РАЗЛОЖИТЬ минуты осознанно, а не надеяться на удачу хеша.
+  const сдвиг = Number.isFinite(Number(минута)) && минута !== null && минута !== '' ? Number(минута) : сдвигМинут(slug);
+  if (msk.getUTCMinutes() < сдвиг) return `слот ${slot}:00 открыт, жду свою минуту (${сдвиг}, сейчас ${msk.getUTCMinutes()})`;
+  if (lastPostedAt) { const lm = new Date(lastPostedAt.getTime() + 3 * 3600e3);
+    if (lm.getUTCFullYear() === msk.getUTCFullYear() && lm.getUTCMonth() === msk.getUTCMonth() && lm.getUTCDate() === msk.getUTCDate() && lm.getUTCHours() >= slot) return `слот ${slot}:00 уже отработан`; }
+  return null;
+}
+// ЖЁСТКИЙ МИНИМУМ МЕЖДУ ЗАЛИВКАМИ (приказ 21.08): даже если раннер лежал и слоты просрочены,
+// два ролика подряд уходить не должны — для ютуба это метка спам-залпа.
+const HARD_GAP_MIN = 30;
+// РАЗГОН НОВОГО КАНАЛА: пока на канале мало роликов, следующий постим только когда предыдущий
+// набрал хотя бы один просмотр. Ноль просмотров через час после заливки = канал в тени, лить дальше вредно.
+const WARMUP_POSTS = 3;          // сколько первых роликов проверяем на живость
+const WARMUP_WAIT_MIN = 60;      // сколько ждём первого просмотра, прежде чем признать канал тихим
+// ПОТОЛОК ОЖИДАНИЯ (29.08). Гейт выше задумывался как защита от слива в тень, но на СВЕЖЕМ канале
+// он запирал конвейер навсегда: ютуб держит новый канал в песочнице сутками и просмотров не даёт,
+// раннер видел ноль и переставал лить, канал не рос и просмотров не появлялось. Замер 29.08:
+// шесть новых каналов встали на двух роликах, у старых при том же контенте 1200-4800 просмотров
+// за 48 часов. Поэтому ждём просмотр, но не дольше половины суток: дальше пробуем следующий ролик.
+const WARMUP_MAX_HOLD_MIN = 720;
+async function firstViewGate(s) {
+  if (s.platform && s.platform !== 'youtube') return null;
+  const { rows } = await q(`SELECT count(*) n FROM yt_queue WHERE channel_id=$1 AND status='posted'`, [s.id]);
+  if (Number(rows[0].n || 0) >= WARMUP_POSTS) return null;
+  const { rows: last } = await q(`SELECT video_id, posted_at FROM yt_queue WHERE channel_id=$1 AND status='posted' AND video_id IS NOT NULL ORDER BY posted_at DESC LIMIT 1`, [s.id]);
+  if (!last[0]) return null;                       // первый ролик канала — льём без условий
+  const ageMin = (Date.now() - new Date(last[0].posted_at).getTime()) / 60e3;
+  let views = 0;
+  try {
+    const tok = await accessToken(s);
+    const j = await fetch(`https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${last[0].video_id}`,
+      { headers: { authorization: 'Bearer ' + tok } }).then((r) => r.json());
+    views = Number(j.items?.[0]?.statistics?.viewCount || 0);
+  } catch { return null; }                         // не смогли спросить — не блокируем конвейер
+  if (views > 0) return null;
+  await q(`UPDATE yt_stats SET views=0 WHERE video_id=$1`, [last[0].video_id]).catch(() => {});
+  if (ageMin >= WARMUP_MAX_HOLD_MIN) return null;  // полсуток отстоя прошли, канал не запираем
+  return ageMin >= WARMUP_WAIT_MIN
+    ? `разгон: у прошлого ролика 0 просмотров за ${Math.round(ageMin)} мин, канал похож на тихий — не лью дальше`
+    : `разгон: жду первый просмотр прошлого ролика (${Math.round(ageMin)} из ${WARMUP_WAIT_MIN} мин)`;
+}
+async function canPostNow(s) {
+  if (!s.enabled) return 'автопостинг выключен';
+  if ((!s.platform || s.platform === 'youtube') && !s.refresh_token) return 'канал не подключён';
+  if (s.platform && s.platform !== 'youtube' && !(s.auth && (s.auth.access_token || s.auth.token))) return 'нет ключа платформы';
+  const { rows } = await q(`SELECT count(*) FILTER (WHERE (posted_at AT TIME ZONE 'Europe/Moscow')::date = (now() AT TIME ZONE 'Europe/Moscow')::date) today, max(posted_at) last FROM yt_queue WHERE channel_id=$1 AND status='posted'`, [s.id]);
+  const today = Number(rows[0].today || 0); const lastD = rows[0].last ? new Date(rows[0].last) : null;
+  if (today >= s.per_day) return `лимит ${s.per_day}/сутки выбран`;
+  const gapMin = Math.max(Number(s.gap_min) || 0, HARD_GAP_MIN);
+  if (lastD && Date.now() - lastD.getTime() < gapMin * 60e3) return `пауза до ${new Date(lastD.getTime() + gapMin * 60e3).toLocaleTimeString('ru-RU').slice(0, 5)}`;
+  const warm = await firstViewGate(s); if (warm) return warm;
+  return slotOpen(s.post_hours, lastD, new Date(), s.slug, s.post_minute);
+}
+async function beat(phase, note) {
+  await q(`INSERT INTO runner_heartbeat (runner, pid, host, phase, note, tick_at) VALUES ($1,$2,$3,$4,$5,now())
+           ON CONFLICT (runner) DO UPDATE SET pid=$2, host=$3, phase=$4, note=$5, tick_at=now()`, [RUNNER, process.pid, os.hostname(), phase, note || null]).catch(() => {});
+}
+
+// ---- команды ----
+async function cmdScan(explicitFiles) {
+  const ch = await chan();
+  const dir = args[1]; if (!explicitFiles && (!dir || !fs.existsSync(dir))) throw new Error('scan <папка>');
+  const limit = +flag('--limit', 0) || 0; const at = flag('--at', null);
+  let files = explicitFiles || [];
+  if (!explicitFiles) (function walk(d) { for (const n of safeList(d)) { const p = path.join(d, n); let st; try { st = fs.statSync(p); } catch { continue; } if (st.isDirectory()) walk(p); else if (/\.mp4$/i.test(n) && !n.startsWith('.')) files.push(p); } })(dir);
+  if (!explicitFiles) { files.sort(); if (has('--shuffle')) files.sort(() => Math.random() - 0.5); }
+  let added = 0, dup = 0, noCover = 0;
+  for (const f of files) {
+    if (limit && added >= limit) break;
+    const hash = fileHash(f); const sc = findSidecar(f);
+    const srcText = sc ? fs.readFileSync(sc, 'utf8').trim() : null;
+    // Название из имени файла берём только если это человеческая фраза (кириллица без кодов шаблонов),
+    // иначе оставляем null → пул названий из настроек.
+    const stem = path.basename(f, '.mp4').replace(/^\d{3}_/, '').replace(/[-_]+/g, ' ');
+    const srcTitle = /^[\p{Script=Cyrillic}\s,!?]{12,}$/u.test(stem) ? stem : null;
+    const cover = findCover(f);
+    const r = await q(`INSERT INTO yt_queue (channel_id, file_path, file_hash, src_title, src_text, scheduled_at, cover_path) VALUES ($7,$1,$2,$3,$4,$5,$6)
+                       ON CONFLICT (file_hash) WHERE file_hash IS NOT NULL DO NOTHING`, [f, hash, sc ? null : srcTitle, srcText, at && at !== true ? at : null, cover, ch.id]);
+    if (!cover) noCover++;
+    r.rowCount ? added++ : dup++;
+  }
+  const { rows } = await q(`SELECT count(*) n FROM yt_queue WHERE status='queued' AND channel_id=$1`, [ch.id]);
+  log(`scan [${ch.slug}]: найдено ${files.length}, добавлено ${added} (без обложки ${noCover}), дублей ${dup}, в очереди канала ${rows[0].n}`);
+}
+
+async function postOne(s, dry, force) {
+  // Advisory-лок на канал: 21.08 форс (once --force) и фоновый цикл стрельнули в одну минуту,
+  // цикл прочитал счётчик ДО коммита форсового поста — по 2 ролика разом на трёх каналах.
+  // Лок сериализует, а перечитка canPostNow ПОСЛЕ захвата видит уже записанный чужой пост.
+  if (!dry) await q(`SELECT pg_advisory_lock(823000 + $1)`, [s.id]);
+  try {
+    return await postOneЗаЛоком(s, dry, force);
+  } finally {
+    if (!dry) await q(`SELECT pg_advisory_unlock(823000 + $1)`, [s.id]).catch(() => {});
+  }
+}
+// Ролик, загруженный через панель: байты лежат в media_uploads, кладём во временный файл на маке.
+// media_url формата 'upload:<uuid>' — так панель помечает свою загрузку; обычный http(s) тоже качаем.
+const UPLOAD_DIR = path.join(os.tmpdir(), 'ytrunner-uploads');
+async function materializeUpload(item) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  const dst = path.join(UPLOAD_DIR, `q${item.id}.mp4`);
+  if (fs.existsSync(dst) && fs.statSync(dst).size > 0) return dst;
+  const u = String(item.media_url || '');
+  if (u.startsWith('upload:')) {
+    const { rows } = await q(`SELECT bytes, size_bytes FROM media_uploads WHERE id=$1`, [u.slice(7)]);
+    if (!rows[0] || !rows[0].bytes) throw new Error('загрузки нет в базе');
+    fs.writeFileSync(dst, rows[0].bytes);
+  } else if (/^https?:/.test(u)) {
+    const r = await fetch(u);
+    if (!r.ok) throw new Error('скачивание ' + r.status);
+    fs.writeFileSync(dst, Buffer.from(await r.arrayBuffer()));
+  } else throw new Error('непонятный источник: ' + u.slice(0, 40));
+  const sz = fs.statSync(dst).size;
+  if (!sz) { fs.unlinkSync(dst); throw new Error('пустой файл'); }
+  log(`   ролик из панели: ${(sz / 1e6).toFixed(1)}MB → ${path.basename(dst)}`);
+  return dst;
+}
+async function postOneЗаЛоком(s, dry, force) {
+  if (!dry && !force) { const g = await canPostNow(s); if (g) return g; }
+  const sel = dry
+    ? await q(`SELECT * FROM yt_queue WHERE channel_id=$1 AND status='queued' AND (file_path IS NOT NULL OR media_url IS NOT NULL) ORDER BY (scheduled_at IS NULL), scheduled_at, id LIMIT 1`, [s.id])
+    : await q(`UPDATE yt_queue SET status='uploading', locked_at=now() WHERE id = (
+                 SELECT id FROM yt_queue WHERE channel_id=$1 AND status='queued' AND (file_path IS NOT NULL OR media_url IS NOT NULL) AND (scheduled_at IS NULL OR scheduled_at <= now())
+                 ORDER BY (scheduled_at IS NULL), scheduled_at, (ai_title IS NULL), id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *`, [s.id]);
+  const item = sel.rows[0];
+  if (!item) return 'очередь (файлы) пуста';
+  if (!item.file_path && item.media_url) {
+    try { item.file_path = await materializeUpload(item); }
+    catch (e) { await q(`UPDATE yt_queue SET status='error', error=$2 WHERE id=$1`, [item.id, 'не смог забрать ролик из панели: ' + String(e.message || e).slice(0, 160)]); return 'ролик из панели не забрался: #' + item.id; }
+  }
+  if (!fs.existsSync(item.file_path)) { await q(`UPDATE yt_queue SET status='error', error='файл не найден на маке' WHERE id=$1`, [item.id]); return 'файл пропал: ' + item.file_path; }
+  // Канал про разбор внешности реального человека: рисованные превращения сюда не идут.
+  if (!allowedForChannel(item.file_path, s)) {
+    // Личный файл владельца и рисованный стиль отсекаются одним гейтом, но причины разные, и в
+    // журнале они должны читаться по-разному: 26.08 личный ролик с телефона ушёл в ленту ВК, и
+    // пометка «рисованный стиль» тогда сбила бы с толку при разборе.
+    const причина = личныйФайл(item.file_path)
+      ? 'ЛИЧНЫЙ ФАЙЛ ВЛАДЕЛЬЦА (имя с камеры), в постинг не идёт'
+      : 'не для этого канала: рисованный стиль «' + styleOf(item.file_path) + '»';
+    await q(`UPDATE yt_queue SET status='skipped', error=$2 WHERE id=$1`, [item.id, причина]);
+    return (личныйФайл(item.file_path) ? 'ЗАБЛОКИРОВАН ЛИЧНЫЙ ФАЙЛ: ' : 'пропустил рисованный: ') + path.basename(item.file_path);
+  }
+  try {
+    let r;
+    if (dry || !s.platform || s.platform === 'youtube') r = await upload(item, s, dry);
+    else {
+      const meta = buildMeta(s, item);
+      const bad = metaProblems(meta); if (bad) throw new Error('текст не прошёл проверку: ' + bad);
+      const cover = item.cover_path && fs.existsSync(item.cover_path) ? item.cover_path : findCover(item.file_path);
+      item._src = has('--no-bake') ? item.file_path : bakeCover(item.file_path, cover, path.join(os.tmpdir(), 'ytrunner-baked'));
+      log(`→ #${item.id} [${s.platform}] ${path.basename(item.file_path)}`);
+      log(`   ${meta.title}`);
+      r = s.platform === 'vk' ? await uploadVK(item, s, meta) : s.platform === 'rutube' ? await uploadRutube(item, s, meta) : (() => { throw new Error('платформа ' + s.platform + ' не поддержана'); })();
+      r.meta = r.meta || meta;
+    }
+    if (!dry) {
+      const link = r.url || ('https://youtube.com/shorts/' + r.id);
+      await q(`UPDATE yt_queue SET status='posted', video_id=$2, url=$3, title=$4, description=$5, utm_content=$6, posted_at=now(), error=NULL WHERE id=$1`,
+        [item.id, r.id, link, r.meta.title, r.meta.description, r.meta.utm_content]);
+      log('   ✓ ' + link, s.privacy === 'private' ? '(черновик/private)' : '');
+      await notifyTg(`${s.platform === 'vk' ? 'вк' : s.platform === 'rutube' ? 'рутуб' : 'ютуб'} [${s.name}] ${s.privacy === 'private' ? 'черновик' : 'выложен'}: ${r.meta.title}\n${s.platform === 'youtube' || !s.platform ? 'https://studio.youtube.com/video/' + r.id + '/edit' : (r.url || '')}`);
+    }
+    return 'ok';
+  } catch (e) {
+    const m = e.message || String(e);
+    const back = e.reason === 'quotaExceeded' || e.reason === 'uploadLimitExceeded' || /quota|uploadLimit/i.test(m);
+    await q(`UPDATE yt_queue SET status=$2, error=$3, locked_at=NULL WHERE id=$1`, [item.id, back ? 'queued' : 'error', m.slice(0, 500)]);
+    log('   ✗', m);
+    if (s.platform === 'vk') await vkTokenAlert(m);
+    return back ? 'QUOTA' : 'error';
+  }
+}
+
+async function cmdLoop() {
+  // Singleton: два loop-процесса наперегонки проскакивают гейт темпа и постят пачкой (баг 18.08).
+  const LOCK = require('os').tmpdir() + '/ytrunner.loop.lock';
+  try { const old = +fs.readFileSync(LOCK, 'utf8'); process.kill(old, 0); throw new Error(`уже запущен loop (pid ${old}), выхожу`); }
+  catch (e) { if (/уже запущен/.test(e.message)) { console.error(e.message); process.exit(1); } }
+  fs.writeFileSync(LOCK, String(process.pid));
+  for (const sig of ['SIGINT', 'SIGTERM', 'exit']) process.on(sig, () => { try { if (+fs.readFileSync(LOCK, 'utf8') === process.pid) fs.unlinkSync(LOCK); } catch {} });
+  const poll = (+flag('--poll', 60) || 60) * 1000;
+  log('ytrunner loop, опрос каждые', poll / 1000, 'с');
+  for (;;) {
+    const notes = []; let any = false;
+    try {
+      const chans = (await q(`SELECT * FROM yt_channels ORDER BY id`)).rows;
+      for (const c of chans) {
+        let r;
+        try { r = await postOne(c, false, false); } catch (e) { r = 'сбой: ' + e.message; log(`[${c.slug}]`, r); if (/terminated|ECONN|timeout/i.test(e.message)) throw e; }
+        if (r === 'ok') any = true;
+        notes.push(`${c.slug}: ${r}`);
+      }
+    } catch (e) { notes.push('сбой БД: ' + e.message); log(notes[notes.length - 1]); try { await db.end(); } catch {} await connect().catch(() => {}); }
+    await beat(any ? 'job' : 'idle', notes.join(' | '));
+    if (!any) process.stdout.write(`\r[${new Date().toLocaleTimeString('ru-RU').slice(0, 5)}] ${notes.join(' | ')}            `);
+    await sleep(notes.some((n) => /QUOTA/.test(n)) && !any ? 30 * 60e3 : poll);
+  }
+}
+
+async function cmdStatus() {
+  for (const s of (await q(`SELECT * FROM yt_channels ORDER BY id`)).rows) {
+    const by = (await q(`SELECT status, count(*) n FROM yt_queue WHERE channel_id=$1 GROUP BY status`, [s.id])).rows;
+    console.log(`\n[${s.id} ${s.slug}] ${s.name} · ${s.refresh_token ? (s.title || s.channel_id) : 'НЕ ПОДКЛЮЧЁН'}`);
+    console.log('  очередь:', by.map((r) => `${r.status}=${r.n}`).join(' ') || 'пусто');
+    console.log('  темп:', s.per_day, '/сутки, пауза', s.gap_min, 'мин, слоты', s.post_hours, 'МСК,', s.privacy, '| окно:', (await canPostNow(s)) || 'открыто');
+    for (const r of (await q(`SELECT id, url, title, to_char(posted_at,'DD.MM HH24:MI') t FROM yt_queue WHERE channel_id=$1 AND status='posted' ORDER BY posted_at DESC LIMIT 3`, [s.id])).rows) console.log('   ', r.t, r.url, '|', r.title);
+    for (const r of (await q(`SELECT id, file_path, error FROM yt_queue WHERE channel_id=$1 AND status='error' ORDER BY id DESC LIMIT 3`, [s.id])).rows) console.log('    ERR #' + r.id, path.basename(r.file_path || ''), '|', r.error);
+  }
+}
+
+(async () => {
+  await connect();
+  try {
+    if (cmd === 'scan') await cmdScan();
+    else if (cmd === 'add') await cmdScan(args.slice(1).filter((a) => !a.startsWith('--') && /\.mp4$/i.test(a) && fs.existsSync(a)));
+    else if (cmd === 'loop') await cmdLoop();
+    else if (cmd === 'once') console.log(await postOne(await chan(), has('--dry'), has('--force')));
+    else if (cmd === 'status') await cmdStatus();
+    else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 15).join('\n'));
+  } catch (e) { console.error('FATAL', e.message); process.exitCode = 1; }
+  finally { if (cmd !== 'loop') await db.end().catch(() => {}); }
+})();
